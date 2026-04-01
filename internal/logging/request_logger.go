@@ -41,15 +41,17 @@ type RequestLogger interface {
 	//   - statusCode: The response status code
 	//   - responseHeaders: The response headers
 	//   - response: The raw response data
+	//   - websocketTimeline: Optional downstream websocket event timeline
 	//   - apiRequest: The API request data
 	//   - apiResponse: The API response data
+	//   - apiWebsocketTimeline: Optional upstream websocket event timeline
 	//   - requestID: Optional request ID for log file naming
 	//   - requestTimestamp: When the request was received
 	//   - apiResponseTimestamp: When the API response was received
 	//
 	// Returns:
 	//   - error: An error if logging fails, nil otherwise
-	LogRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, apiRequest, apiResponse []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error
+	LogRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error
 
 	// LogStreamingRequest initiates logging for a streaming request and returns a writer for chunks.
 	//
@@ -203,17 +205,17 @@ func (l *FileRequestLogger) SetErrorLogsMaxFiles(maxFiles int) {
 //
 // Returns:
 //   - error: An error if logging fails, nil otherwise
-func (l *FileRequestLogger) LogRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, apiRequest, apiResponse []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
-	return l.logRequest(url, method, requestHeaders, body, statusCode, responseHeaders, response, apiRequest, apiResponse, apiResponseErrors, false, requestID, requestTimestamp, apiResponseTimestamp)
+func (l *FileRequestLogger) LogRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+	return l.logRequest(url, method, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors, false, requestID, requestTimestamp, apiResponseTimestamp)
 }
 
 // LogRequestWithOptions logs a request with optional forced logging behavior.
 // The force flag allows writing error logs even when regular request logging is disabled.
-func (l *FileRequestLogger) LogRequestWithOptions(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, apiRequest, apiResponse []byte, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
-	return l.logRequest(url, method, requestHeaders, body, statusCode, responseHeaders, response, apiRequest, apiResponse, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
+func (l *FileRequestLogger) LogRequestWithOptions(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+	return l.logRequest(url, method, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
 }
 
-func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, apiRequest, apiResponse []byte, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
 	if !l.enabled && !force {
 		return nil
 	}
@@ -260,8 +262,10 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 		requestHeaders,
 		body,
 		requestBodyPath,
+		websocketTimeline,
 		apiRequest,
 		apiResponse,
+		apiWebsocketTimeline,
 		apiResponseErrors,
 		statusCode,
 		responseHeaders,
@@ -518,8 +522,10 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	requestHeaders map[string][]string,
 	requestBody []byte,
 	requestBodyPath string,
+	websocketTimeline []byte,
 	apiRequest []byte,
 	apiResponse []byte,
+	apiWebsocketTimeline []byte,
 	apiResponseErrors []*interfaces.ErrorMessage,
 	statusCode int,
 	responseHeaders map[string][]string,
@@ -531,7 +537,16 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	if requestTimestamp.IsZero() {
 		requestTimestamp = time.Now()
 	}
-	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestBodyPath, requestTimestamp); errWrite != nil {
+	isWebsocketTranscript := hasSectionPayload(websocketTimeline)
+	downstreamTransport := inferDownstreamTransport(requestHeaders, websocketTimeline)
+	upstreamTransport := inferUpstreamTransport(apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors)
+	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestBodyPath, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
+		return errWrite
+	}
+	if errWrite := writeAPISection(w, "=== WEBSOCKET TIMELINE ===\n", "=== WEBSOCKET TIMELINE", websocketTimeline, time.Time{}); errWrite != nil {
+		return errWrite
+	}
+	if errWrite := writeAPISection(w, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", apiWebsocketTimeline, time.Time{}); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISection(w, "=== API REQUEST ===\n", "=== API REQUEST", apiRequest, time.Time{}); errWrite != nil {
@@ -543,6 +558,9 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	if errWrite := writeAPISection(w, "=== API RESPONSE ===\n", "=== API RESPONSE", apiResponse, apiResponseTimestamp); errWrite != nil {
 		return errWrite
 	}
+	if isWebsocketTranscript {
+		return nil
+	}
 	return writeResponseSection(w, statusCode, true, responseHeaders, bytes.NewReader(response), decompressErr, true)
 }
 
@@ -553,6 +571,9 @@ func writeRequestInfoWithBody(
 	body []byte,
 	bodyPath string,
 	timestamp time.Time,
+	downstreamTransport string,
+	upstreamTransport string,
+	includeBody bool,
 ) error {
 	if _, errWrite := io.WriteString(w, "=== REQUEST INFO ===\n"); errWrite != nil {
 		return errWrite
@@ -565,6 +586,16 @@ func writeRequestInfoWithBody(
 	}
 	if _, errWrite := io.WriteString(w, fmt.Sprintf("Method: %s\n", method)); errWrite != nil {
 		return errWrite
+	}
+	if strings.TrimSpace(downstreamTransport) != "" {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Downstream Transport: %s\n", downstreamTransport)); errWrite != nil {
+			return errWrite
+		}
+	}
+	if strings.TrimSpace(upstreamTransport) != "" {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Upstream Transport: %s\n", upstreamTransport)); errWrite != nil {
+			return errWrite
+		}
 	}
 	if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano))); errWrite != nil {
 		return errWrite
@@ -586,6 +617,10 @@ func writeRequestInfoWithBody(
 	}
 	if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
 		return errWrite
+	}
+
+	if !includeBody {
+		return nil
 	}
 
 	if _, errWrite := io.WriteString(w, "=== REQUEST BODY ===\n"); errWrite != nil {
@@ -612,6 +647,41 @@ func writeRequestInfoWithBody(
 		return errWrite
 	}
 	return nil
+}
+
+func hasSectionPayload(payload []byte) bool {
+	return len(bytes.TrimSpace(payload)) > 0
+}
+
+func inferDownstreamTransport(headers map[string][]string, websocketTimeline []byte) string {
+	if hasSectionPayload(websocketTimeline) {
+		return "websocket"
+	}
+	for key, values := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), "Upgrade") {
+			for _, value := range values {
+				if strings.EqualFold(strings.TrimSpace(value), "websocket") {
+					return "websocket"
+				}
+			}
+		}
+	}
+	return "http"
+}
+
+func inferUpstreamTransport(apiRequest, apiResponse, apiWebsocketTimeline []byte, _ []*interfaces.ErrorMessage) string {
+	hasHTTP := hasSectionPayload(apiRequest) || hasSectionPayload(apiResponse)
+	hasWS := hasSectionPayload(apiWebsocketTimeline)
+	switch {
+	case hasHTTP && hasWS:
+		return "websocket+http"
+	case hasWS:
+		return "websocket"
+	case hasHTTP:
+		return "http"
+	default:
+		return ""
+	}
 }
 
 func writeAPISection(w io.Writer, sectionHeader string, sectionPrefix string, payload []byte, timestamp time.Time) error {
@@ -724,6 +794,7 @@ func writeResponseSection(w io.Writer, statusCode int, statusWritten bool, respo
 //   - method: The HTTP method
 //   - headers: The request headers
 //   - body: The request body
+//   - websocketTimeline: The downstream websocket event timeline
 //   - apiRequest: The API request data
 //   - apiResponse: The API response data
 //   - response: The raw response data
@@ -732,11 +803,42 @@ func writeResponseSection(w io.Writer, statusCode int, statusWritten bool, respo
 //
 // Returns:
 //   - string: The formatted log content
-func (l *FileRequestLogger) formatLogContent(url, method string, headers map[string][]string, body, apiRequest, apiResponse, response []byte, status int, responseHeaders map[string][]string, apiResponseErrors []*interfaces.ErrorMessage) string {
+func (l *FileRequestLogger) formatLogContent(url, method string, headers map[string][]string, body, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline, response []byte, status int, responseHeaders map[string][]string, apiResponseErrors []*interfaces.ErrorMessage) string {
 	var content strings.Builder
+	isWebsocketTranscript := hasSectionPayload(websocketTimeline)
+	downstreamTransport := inferDownstreamTransport(headers, websocketTimeline)
+	upstreamTransport := inferUpstreamTransport(apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors)
 
 	// Request info
-	content.WriteString(l.formatRequestInfo(url, method, headers, body))
+	content.WriteString(l.formatRequestInfo(url, method, headers, body, downstreamTransport, upstreamTransport, !isWebsocketTranscript))
+
+	if len(websocketTimeline) > 0 {
+		if bytes.HasPrefix(websocketTimeline, []byte("=== WEBSOCKET TIMELINE")) {
+			content.Write(websocketTimeline)
+			if !bytes.HasSuffix(websocketTimeline, []byte("\n")) {
+				content.WriteString("\n")
+			}
+		} else {
+			content.WriteString("=== WEBSOCKET TIMELINE ===\n")
+			content.Write(websocketTimeline)
+			content.WriteString("\n")
+		}
+		content.WriteString("\n")
+	}
+
+	if len(apiWebsocketTimeline) > 0 {
+		if bytes.HasPrefix(apiWebsocketTimeline, []byte("=== API WEBSOCKET TIMELINE")) {
+			content.Write(apiWebsocketTimeline)
+			if !bytes.HasSuffix(apiWebsocketTimeline, []byte("\n")) {
+				content.WriteString("\n")
+			}
+		} else {
+			content.WriteString("=== API WEBSOCKET TIMELINE ===\n")
+			content.Write(apiWebsocketTimeline)
+			content.WriteString("\n")
+		}
+		content.WriteString("\n")
+	}
 
 	if len(apiRequest) > 0 {
 		if bytes.HasPrefix(apiRequest, []byte("=== API REQUEST")) {
@@ -771,6 +873,10 @@ func (l *FileRequestLogger) formatLogContent(url, method string, headers map[str
 			content.WriteString("\n")
 		}
 		content.WriteString("\n")
+	}
+
+	if isWebsocketTranscript {
+		return content.String()
 	}
 
 	// Response section
@@ -933,13 +1039,19 @@ func (l *FileRequestLogger) decompressZstd(data []byte) ([]byte, error) {
 //
 // Returns:
 //   - string: The formatted request information
-func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[string][]string, body []byte) string {
+func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[string][]string, body []byte, downstreamTransport string, upstreamTransport string, includeBody bool) string {
 	var content strings.Builder
 
 	content.WriteString("=== REQUEST INFO ===\n")
 	content.WriteString(fmt.Sprintf("Version: %s\n", buildinfo.Version))
 	content.WriteString(fmt.Sprintf("URL: %s\n", url))
 	content.WriteString(fmt.Sprintf("Method: %s\n", method))
+	if strings.TrimSpace(downstreamTransport) != "" {
+		content.WriteString(fmt.Sprintf("Downstream Transport: %s\n", downstreamTransport))
+	}
+	if strings.TrimSpace(upstreamTransport) != "" {
+		content.WriteString(fmt.Sprintf("Upstream Transport: %s\n", upstreamTransport))
+	}
 	content.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
 	content.WriteString("\n")
 
@@ -951,6 +1063,10 @@ func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[st
 		}
 	}
 	content.WriteString("\n")
+
+	if !includeBody {
+		return content.String()
+	}
 
 	content.WriteString("=== REQUEST BODY ===\n")
 	content.Write(body)
@@ -1182,7 +1298,7 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 }
 
 func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
-	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiResponse, nil, nil), true); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISection(logFile, "=== API REQUEST ===\n", "=== API REQUEST", w.apiRequest, time.Time{}); errWrite != nil {

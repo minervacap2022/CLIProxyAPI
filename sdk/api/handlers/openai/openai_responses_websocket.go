@@ -32,8 +32,7 @@ const (
 	wsEventTypeCompleted = "response.completed"
 	wsDoneMarker         = "[DONE]"
 	wsTurnStateHeader    = "x-codex-turn-state"
-	wsRequestBodyKey     = "REQUEST_BODY_OVERRIDE"
-	wsResponseBodyKey    = "RESPONSE_BODY_OVERRIDE"
+	wsTimelineBodyKey    = "WEBSOCKET_TIMELINE_OVERRIDE"
 )
 
 var responsesWebsocketUpgrader = websocket.Upgrader{
@@ -58,8 +57,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	clientIP := websocketClientAddress(c)
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
 	var wsTerminateErr error
-	var wsRequestLog strings.Builder
-	var wsResponseLog strings.Builder
+	var wsTimelineLog strings.Builder
 	defer func() {
 		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
 		if wsTerminateErr != nil {
@@ -71,8 +69,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			h.AuthManager.CloseExecutionSession(passthroughSessionID)
 			log.Infof("responses websocket: upstream execution session closed id=%s", passthroughSessionID)
 		}
-		setWebsocketRequestBody(c, wsRequestLog.String())
-		setWebsocketResponseBody(c, wsResponseLog.String())
+		setWebsocketTimelineBody(c, wsTimelineLog.String())
 		if errClose := conn.Close(); errClose != nil {
 			log.Warnf("responses websocket: close connection error: %v", errClose)
 		}
@@ -103,7 +100,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// 	websocketPayloadEventType(payload),
 		// 	websocketPayloadPreview(payload),
 		// )
-		appendWebsocketEvent(&wsRequestLog, "request", payload)
+		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now())
 
 		allowIncrementalInputWithPreviousResponseID := false
 		if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
@@ -131,7 +128,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			markAPIResponseTimestamp(c)
 			errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
-			appendWebsocketEvent(&wsResponseLog, "response", errorPayload)
 			log.Infof(
 				"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 				passthroughSessionID,
@@ -148,6 +144,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				)
 				return
 			}
+			appendWebsocketTimelineEvent(&wsTimelineLog, "response", errorPayload, time.Now())
 			continue
 		}
 		if shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
@@ -159,7 +156,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			lastRequest = updatedLastRequest
 			lastResponseOutput = []byte("[]")
-			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, conn, requestJSON, &wsResponseLog, passthroughSessionID); errWrite != nil {
+			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, conn, requestJSON, &wsTimelineLog, passthroughSessionID); errWrite != nil {
 				wsTerminateErr = errWrite
 				return
 			}
@@ -193,7 +190,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
-		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsResponseLog, passthroughSessionID)
+		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID)
 		if errForward != nil {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
@@ -597,7 +594,7 @@ func writeResponsesWebsocketSyntheticPrewarm(
 	c *gin.Context,
 	conn *websocket.Conn,
 	requestJSON []byte,
-	wsBodyLog *strings.Builder,
+	wsTimelineLog *strings.Builder,
 	sessionID string,
 ) error {
 	payloads, errPayloads := syntheticResponsesWebsocketPrewarmPayloads(requestJSON)
@@ -606,7 +603,6 @@ func writeResponsesWebsocketSyntheticPrewarm(
 	}
 	for i := 0; i < len(payloads); i++ {
 		markAPIResponseTimestamp(c)
-		appendWebsocketEvent(wsBodyLog, "response", payloads[i])
 		// log.Infof(
 		// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 		// 	sessionID,
@@ -623,6 +619,7 @@ func writeResponsesWebsocketSyntheticPrewarm(
 			)
 			return errWrite
 		}
+		appendWebsocketTimelineEvent(wsTimelineLog, "response", payloads[i], time.Now())
 	}
 	return nil
 }
@@ -713,7 +710,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	cancel handlers.APIHandlerCancelFunc,
 	data <-chan []byte,
 	errs <-chan *interfaces.ErrorMessage,
-	wsBodyLog *strings.Builder,
+	wsTimelineLog *strings.Builder,
 	sessionID string,
 ) ([]byte, error) {
 	completed := false
@@ -737,7 +734,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 				markAPIResponseTimestamp(c)
 				errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
-				appendWebsocketEvent(wsBodyLog, "response", errorPayload)
 				log.Infof(
 					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 					sessionID,
@@ -755,6 +751,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					cancel(errMsg.Error)
 					return completedOutput, errWrite
 				}
+				appendWebsocketTimelineEvent(wsTimelineLog, "response", errorPayload, time.Now())
 			}
 			if errMsg != nil {
 				cancel(errMsg.Error)
@@ -772,7 +769,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 					markAPIResponseTimestamp(c)
 					errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
-					appendWebsocketEvent(wsBodyLog, "response", errorPayload)
 					log.Infof(
 						"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 						sessionID,
@@ -790,6 +786,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						cancel(errMsg.Error)
 						return completedOutput, errWrite
 					}
+					appendWebsocketTimelineEvent(wsTimelineLog, "response", errorPayload, time.Now())
 					cancel(errMsg.Error)
 					return completedOutput, nil
 				}
@@ -806,7 +803,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					completedOutput = responseCompletedOutputFromPayload(payloads[i])
 				}
 				markAPIResponseTimestamp(c)
-				appendWebsocketEvent(wsBodyLog, "response", payloads[i])
 				// log.Infof(
 				// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 				// 	sessionID,
@@ -824,6 +820,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					cancel(errWrite)
 					return completedOutput, errWrite
 				}
+				appendWebsocketTimelineEvent(wsTimelineLog, "response", payloads[i], time.Now())
 			}
 		}
 	}
@@ -979,12 +976,8 @@ func websocketPayloadPreview(payload []byte) string {
 	return previewText
 }
 
-func setWebsocketRequestBody(c *gin.Context, body string) {
-	setWebsocketBody(c, wsRequestBodyKey, body)
-}
-
-func setWebsocketResponseBody(c *gin.Context, body string) {
-	setWebsocketBody(c, wsResponseBodyKey, body)
+func setWebsocketTimelineBody(c *gin.Context, body string) {
+	setWebsocketBody(c, wsTimelineBodyKey, body)
 }
 
 func setWebsocketBody(c *gin.Context, key string, body string) {
@@ -996,6 +989,27 @@ func setWebsocketBody(c *gin.Context, key string, body string) {
 		return
 	}
 	c.Set(key, []byte(trimmedBody))
+}
+
+func appendWebsocketTimelineEvent(builder *strings.Builder, eventType string, payload []byte, timestamp time.Time) {
+	if builder == nil {
+		return
+	}
+	trimmedPayload := bytes.TrimSpace(payload)
+	if len(trimmedPayload) == 0 {
+		return
+	}
+	if builder.Len() > 0 {
+		builder.WriteString("\n")
+	}
+	builder.WriteString("Timestamp: ")
+	builder.WriteString(timestamp.Format(time.RFC3339Nano))
+	builder.WriteString("\n")
+	builder.WriteString("Event: websocket.")
+	builder.WriteString(eventType)
+	builder.WriteString("\n")
+	builder.Write(trimmedPayload)
+	builder.WriteString("\n")
 }
 
 func markAPIResponseTimestamp(c *gin.Context) {

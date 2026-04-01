@@ -100,3 +100,20 @@ func TestExtractBodyOverrideClonesBytes(t *testing.T) {
 		t.Fatalf("override mutated: %q", string(override))
 	}
 }
+
+func TestExtractWebsocketTimelineUsesOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	wrapper := &ResponseWriterWrapper{}
+	if got := wrapper.extractWebsocketTimeline(c); got != nil {
+		t.Fatalf("expected nil websocket timeline, got %q", string(got))
+	}
+
+	c.Set(websocketTimelineOverrideContextKey, []byte("timeline"))
+	body := wrapper.extractWebsocketTimeline(c)
+	if string(body) != "timeline" {
+		t.Fatalf("websocket timeline = %q, want %q", string(body), "timeline")
+	}
+}

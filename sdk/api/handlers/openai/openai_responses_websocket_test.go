@@ -392,51 +392,45 @@ func TestAppendWebsocketEvent(t *testing.T) {
 	}
 }
 
-func TestSetWebsocketRequestBody(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
+func TestAppendWebsocketTimelineEvent(t *testing.T) {
+	var builder strings.Builder
+	ts := time.Date(2026, time.April, 1, 12, 34, 56, 789000000, time.UTC)
 
-	setWebsocketRequestBody(c, " \n ")
-	if _, exists := c.Get(wsRequestBodyKey); exists {
-		t.Fatalf("request body key should not be set for empty body")
-	}
+	appendWebsocketTimelineEvent(&builder, "request", []byte("  {\"type\":\"response.create\"}\n"), ts)
 
-	setWebsocketRequestBody(c, "event body")
-	value, exists := c.Get(wsRequestBodyKey)
-	if !exists {
-		t.Fatalf("request body key not set")
+	got := builder.String()
+	if !strings.Contains(got, "Timestamp: 2026-04-01T12:34:56.789Z") {
+		t.Fatalf("timeline timestamp not found: %s", got)
 	}
-	bodyBytes, ok := value.([]byte)
-	if !ok {
-		t.Fatalf("request body key type mismatch")
+	if !strings.Contains(got, "Event: websocket.request") {
+		t.Fatalf("timeline event not found: %s", got)
 	}
-	if string(bodyBytes) != "event body" {
-		t.Fatalf("request body = %q, want %q", string(bodyBytes), "event body")
+	if !strings.Contains(got, "{\"type\":\"response.create\"}") {
+		t.Fatalf("timeline payload not found: %s", got)
 	}
 }
 
-func TestSetWebsocketResponseBody(t *testing.T) {
+func TestSetWebsocketTimelineBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 
-	setWebsocketResponseBody(c, " \n ")
-	if _, exists := c.Get(wsResponseBodyKey); exists {
-		t.Fatalf("response body key should not be set for empty body")
+	setWebsocketTimelineBody(c, " \n ")
+	if _, exists := c.Get(wsTimelineBodyKey); exists {
+		t.Fatalf("timeline body key should not be set for empty body")
 	}
 
-	setWebsocketResponseBody(c, "response event body")
-	value, exists := c.Get(wsResponseBodyKey)
+	setWebsocketTimelineBody(c, "timeline body")
+	value, exists := c.Get(wsTimelineBodyKey)
 	if !exists {
-		t.Fatalf("response body key not set")
+		t.Fatalf("timeline body key not set")
 	}
 	bodyBytes, ok := value.([]byte)
 	if !ok {
-		t.Fatalf("response body key type mismatch")
+		t.Fatalf("timeline body key type mismatch")
 	}
-	if string(bodyBytes) != "response event body" {
-		t.Fatalf("response body = %q, want %q", string(bodyBytes), "response event body")
+	if string(bodyBytes) != "timeline body" {
+		t.Fatalf("timeline body = %q, want %q", string(bodyBytes), "timeline body")
 	}
 }
 
@@ -568,14 +562,14 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 		close(data)
 		close(errCh)
 
-		var bodyLog strings.Builder
+		var timelineLog strings.Builder
 		completedOutput, err := (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
 			ctx,
 			conn,
 			func(...interface{}) {},
 			data,
 			errCh,
-			&bodyLog,
+			&timelineLog,
 			"session-1",
 		)
 		if err != nil {
@@ -584,6 +578,10 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 		}
 		if gjson.GetBytes(completedOutput, "0.id").String() != "out-1" {
 			serverErrCh <- errors.New("completed output not captured")
+			return
+		}
+		if !strings.Contains(timelineLog.String(), "Event: websocket.response") {
+			serverErrCh <- errors.New("websocket timeline did not capture downstream response")
 			return
 		}
 		serverErrCh <- nil

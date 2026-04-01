@@ -16,6 +16,7 @@ import (
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
 const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
+const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
@@ -313,7 +314,7 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		return nil
 	}
 
-	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.extractResponseBody(c), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
+	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.extractResponseBody(c), w.extractWebsocketTimeline(c), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIWebsocketTimeline(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
 }
 
 func (w *ResponseWriterWrapper) cloneHeaders() map[string][]string {
@@ -353,6 +354,18 @@ func (w *ResponseWriterWrapper) extractAPIResponse(c *gin.Context) []byte {
 	return data
 }
 
+func (w *ResponseWriterWrapper) extractAPIWebsocketTimeline(c *gin.Context) []byte {
+	apiTimeline, isExist := c.Get("API_WEBSOCKET_TIMELINE")
+	if !isExist {
+		return nil
+	}
+	data, ok := apiTimeline.([]byte)
+	if !ok || len(data) == 0 {
+		return nil
+	}
+	return bytes.Clone(data)
+}
+
 func (w *ResponseWriterWrapper) extractAPIResponseTimestamp(c *gin.Context) time.Time {
 	ts, isExist := c.Get("API_RESPONSE_TIMESTAMP")
 	if !isExist {
@@ -384,6 +397,10 @@ func (w *ResponseWriterWrapper) extractResponseBody(c *gin.Context) []byte {
 	return bytes.Clone(w.body.Bytes())
 }
 
+func (w *ResponseWriterWrapper) extractWebsocketTimeline(c *gin.Context) []byte {
+	return extractBodyOverride(c, websocketTimelineOverrideContextKey)
+}
+
 func extractBodyOverride(c *gin.Context, key string) []byte {
 	if c == nil {
 		return nil
@@ -405,13 +422,13 @@ func extractBodyOverride(c *gin.Context, key string) []byte {
 	return nil
 }
 
-func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, headers map[string][]string, body []byte, apiRequestBody, apiResponseBody []byte, apiResponseTimestamp time.Time, apiResponseErrors []*interfaces.ErrorMessage, forceLog bool) error {
+func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, headers map[string][]string, body, websocketTimeline, apiRequestBody, apiResponseBody, apiWebsocketTimeline []byte, apiResponseTimestamp time.Time, apiResponseErrors []*interfaces.ErrorMessage, forceLog bool) error {
 	if w.requestInfo == nil {
 		return nil
 	}
 
 	if loggerWithOptions, ok := w.logger.(interface {
-		LogRequestWithOptions(string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []*interfaces.ErrorMessage, bool, string, time.Time, time.Time) error
+		LogRequestWithOptions(string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, bool, string, time.Time, time.Time) error
 	}); ok {
 		return loggerWithOptions.LogRequestWithOptions(
 			w.requestInfo.URL,
@@ -421,8 +438,10 @@ func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, h
 			statusCode,
 			headers,
 			body,
+			websocketTimeline,
 			apiRequestBody,
 			apiResponseBody,
+			apiWebsocketTimeline,
 			apiResponseErrors,
 			forceLog,
 			w.requestInfo.RequestID,
@@ -439,8 +458,10 @@ func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, h
 		statusCode,
 		headers,
 		body,
+		websocketTimeline,
 		apiRequestBody,
 		apiResponseBody,
+		apiWebsocketTimeline,
 		apiResponseErrors,
 		w.requestInfo.RequestID,
 		w.requestInfo.Timestamp,
