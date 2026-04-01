@@ -600,7 +600,7 @@ func writeRequestInfoWithBody(
 	if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano))); errWrite != nil {
 		return errWrite
 	}
-	if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+	if errWrite := writeSectionSpacing(w, 1); errWrite != nil {
 		return errWrite
 	}
 
@@ -615,7 +615,7 @@ func writeRequestInfoWithBody(
 			}
 		}
 	}
-	if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+	if errWrite := writeSectionSpacing(w, 1); errWrite != nil {
 		return errWrite
 	}
 
@@ -627,26 +627,72 @@ func writeRequestInfoWithBody(
 		return errWrite
 	}
 
+	bodyTrailingNewlines := 1
 	if bodyPath != "" {
 		bodyFile, errOpen := os.Open(bodyPath)
 		if errOpen != nil {
 			return errOpen
 		}
-		if _, errCopy := io.Copy(w, bodyFile); errCopy != nil {
+		tracker := &trailingNewlineTrackingWriter{writer: w}
+		written, errCopy := io.Copy(tracker, bodyFile)
+		if errCopy != nil {
 			_ = bodyFile.Close()
 			return errCopy
+		}
+		if written > 0 {
+			bodyTrailingNewlines = tracker.trailingNewlines
 		}
 		if errClose := bodyFile.Close(); errClose != nil {
 			log.WithError(errClose).Warn("failed to close request body temp file")
 		}
 	} else if _, errWrite := w.Write(body); errWrite != nil {
 		return errWrite
+	} else if len(body) > 0 {
+		bodyTrailingNewlines = countTrailingNewlinesBytes(body)
 	}
-
-	if _, errWrite := io.WriteString(w, "\n\n"); errWrite != nil {
+	if errWrite := writeSectionSpacing(w, bodyTrailingNewlines); errWrite != nil {
 		return errWrite
 	}
 	return nil
+}
+
+func countTrailingNewlinesBytes(payload []byte) int {
+	count := 0
+	for i := len(payload) - 1; i >= 0; i-- {
+		if payload[i] != '\n' {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func writeSectionSpacing(w io.Writer, trailingNewlines int) error {
+	missingNewlines := 3 - trailingNewlines
+	if missingNewlines <= 0 {
+		return nil
+	}
+	_, errWrite := io.WriteString(w, strings.Repeat("\n", missingNewlines))
+	return errWrite
+}
+
+type trailingNewlineTrackingWriter struct {
+	writer           io.Writer
+	trailingNewlines int
+}
+
+func (t *trailingNewlineTrackingWriter) Write(payload []byte) (int, error) {
+	written, errWrite := t.writer.Write(payload)
+	if written > 0 {
+		writtenPayload := payload[:written]
+		trailingNewlines := countTrailingNewlinesBytes(writtenPayload)
+		if trailingNewlines == len(writtenPayload) {
+			t.trailingNewlines += trailingNewlines
+		} else {
+			t.trailingNewlines = trailingNewlines
+		}
+	}
+	return written, errWrite
 }
 
 func hasSectionPayload(payload []byte) bool {
@@ -693,11 +739,6 @@ func writeAPISection(w io.Writer, sectionHeader string, sectionPrefix string, pa
 		if _, errWrite := w.Write(payload); errWrite != nil {
 			return errWrite
 		}
-		if !bytes.HasSuffix(payload, []byte("\n")) {
-			if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
-				return errWrite
-			}
-		}
 	} else {
 		if _, errWrite := io.WriteString(w, sectionHeader); errWrite != nil {
 			return errWrite
@@ -710,12 +751,9 @@ func writeAPISection(w io.Writer, sectionHeader string, sectionPrefix string, pa
 		if _, errWrite := w.Write(payload); errWrite != nil {
 			return errWrite
 		}
-		if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
-			return errWrite
-		}
 	}
 
-	if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+	if errWrite := writeSectionSpacing(w, countTrailingNewlinesBytes(payload)); errWrite != nil {
 		return errWrite
 	}
 	return nil
@@ -732,12 +770,17 @@ func writeAPIErrorResponses(w io.Writer, apiResponseErrors []*interfaces.ErrorMe
 		if _, errWrite := io.WriteString(w, fmt.Sprintf("HTTP Status: %d\n", apiResponseErrors[i].StatusCode)); errWrite != nil {
 			return errWrite
 		}
+		trailingNewlines := 1
 		if apiResponseErrors[i].Error != nil {
-			if _, errWrite := io.WriteString(w, apiResponseErrors[i].Error.Error()); errWrite != nil {
+			errText := apiResponseErrors[i].Error.Error()
+			if _, errWrite := io.WriteString(w, errText); errWrite != nil {
 				return errWrite
 			}
+			if errText != "" {
+				trailingNewlines = countTrailingNewlinesBytes([]byte(errText))
+			}
 		}
-		if _, errWrite := io.WriteString(w, "\n\n"); errWrite != nil {
+		if errWrite := writeSectionSpacing(w, trailingNewlines); errWrite != nil {
 			return errWrite
 		}
 	}
