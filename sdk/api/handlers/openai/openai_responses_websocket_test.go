@@ -416,6 +416,30 @@ func TestSetWebsocketRequestBody(t *testing.T) {
 	}
 }
 
+func TestSetWebsocketResponseBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	setWebsocketResponseBody(c, " \n ")
+	if _, exists := c.Get(wsResponseBodyKey); exists {
+		t.Fatalf("response body key should not be set for empty body")
+	}
+
+	setWebsocketResponseBody(c, "response event body")
+	value, exists := c.Get(wsResponseBodyKey)
+	if !exists {
+		t.Fatalf("response body key not set")
+	}
+	bodyBytes, ok := value.([]byte)
+	if !ok {
+		t.Fatalf("response body key type mismatch")
+	}
+	if string(bodyBytes) != "response event body" {
+		t.Fatalf("response body = %q, want %q", string(bodyBytes), "response event body")
+	}
+}
+
 func TestRepairResponsesWebsocketToolCallsInsertsCachedOutput(t *testing.T) {
 	cache := newWebsocketToolOutputCache(time.Minute, 10)
 	sessionKey := "session-1"

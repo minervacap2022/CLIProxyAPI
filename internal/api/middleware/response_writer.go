@@ -15,6 +15,7 @@ import (
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
+const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
@@ -312,7 +313,7 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		return nil
 	}
 
-	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.body.Bytes(), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
+	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.extractResponseBody(c), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
 }
 
 func (w *ResponseWriterWrapper) cloneHeaders() map[string][]string {
@@ -364,22 +365,42 @@ func (w *ResponseWriterWrapper) extractAPIResponseTimestamp(c *gin.Context) time
 }
 
 func (w *ResponseWriterWrapper) extractRequestBody(c *gin.Context) []byte {
-	if c != nil {
-		if bodyOverride, isExist := c.Get(requestBodyOverrideContextKey); isExist {
-			switch value := bodyOverride.(type) {
-			case []byte:
-				if len(value) > 0 {
-					return bytes.Clone(value)
-				}
-			case string:
-				if strings.TrimSpace(value) != "" {
-					return []byte(value)
-				}
-			}
-		}
+	if body := extractBodyOverride(c, requestBodyOverrideContextKey); len(body) > 0 {
+		return body
 	}
 	if w.requestInfo != nil && len(w.requestInfo.Body) > 0 {
 		return w.requestInfo.Body
+	}
+	return nil
+}
+
+func (w *ResponseWriterWrapper) extractResponseBody(c *gin.Context) []byte {
+	if body := extractBodyOverride(c, responseBodyOverrideContextKey); len(body) > 0 {
+		return body
+	}
+	if w.body == nil || w.body.Len() == 0 {
+		return nil
+	}
+	return bytes.Clone(w.body.Bytes())
+}
+
+func extractBodyOverride(c *gin.Context, key string) []byte {
+	if c == nil {
+		return nil
+	}
+	bodyOverride, isExist := c.Get(key)
+	if !isExist {
+		return nil
+	}
+	switch value := bodyOverride.(type) {
+	case []byte:
+		if len(value) > 0 {
+			return bytes.Clone(value)
+		}
+	case string:
+		if strings.TrimSpace(value) != "" {
+			return []byte(value)
+		}
 	}
 	return nil
 }
