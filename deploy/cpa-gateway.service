@@ -1,0 +1,14 @@
+[Unit]
+Description=CPA Gateway - Per-Key Model Access Control
+After=cpa.service
+Requires=cpa.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cpa
+ExecStart=/opt/cpa/.gw-venv/bin/python3 /opt/cpa/gateway.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

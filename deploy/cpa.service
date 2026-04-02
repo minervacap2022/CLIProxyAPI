@@ -1,0 +1,13 @@
+[Unit]
+Description=CLI Proxy API Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cpa
+ExecStart=/opt/cpa/cli-proxy-api
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

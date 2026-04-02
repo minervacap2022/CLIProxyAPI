@@ -49,3 +49,11 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+
+# KLIK customization runtime files
+config.yaml
+gateway_config.yaml
+.cli-proxy-api/
+.gw-venv/
+*.log
+__pycache__/
