@@ -2,6 +2,7 @@ package logging
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -166,5 +167,54 @@ func TestInferUpstreamTransport_PrefersWebsocketWhenOnlyTimelineAndErrorsExist(t
 
 	if got := inferUpstreamTransport(nil, nil, apiWebsocketTimeline, apiResponseErrors); got != "websocket" {
 		t.Fatalf("inferUpstreamTransport() = %q, want %q", got, "websocket")
+	}
+}
+
+func TestFileStreamingLogWriter_WriteFinalLogIncludesAPIWebsocketTimeline(t *testing.T) {
+	logger := NewFileRequestLogger(true, t.TempDir(), "", 0)
+
+	streamWriter, err := logger.LogStreamingRequest(
+		"/v1/responses",
+		"POST",
+		map[string][]string{"Content-Type": {"application/json"}},
+		[]byte(`{"model":"gpt-5-codex","stream":true}`),
+		"stream-websocket",
+	)
+	if err != nil {
+		t.Fatalf("LogStreamingRequest error: %v", err)
+	}
+
+	writer, ok := streamWriter.(*FileStreamingLogWriter)
+	if !ok {
+		t.Fatalf("stream writer type = %T, want *FileStreamingLogWriter", streamWriter)
+	}
+
+	if err = writer.WriteStatus(200, map[string][]string{"Content-Type": {"text/event-stream"}}); err != nil {
+		t.Fatalf("WriteStatus error: %v", err)
+	}
+	if err = writer.WriteAPIWebsocketTimeline([]byte("Timestamp: 2026-04-01T12:00:00Z\nEvent: api.websocket.request\n{\"type\":\"response.create\"}\n")); err != nil {
+		t.Fatalf("WriteAPIWebsocketTimeline error: %v", err)
+	}
+	writer.WriteChunkAsync([]byte("data: {\"type\":\"response.completed\"}\n\n"))
+	writer.SetFirstChunkTimestamp(time.Date(2026, time.April, 1, 12, 0, 1, 0, time.UTC))
+
+	if err = writer.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	got, err := os.ReadFile(writer.logFilePath)
+	if err != nil {
+		t.Fatalf("ReadFile error: %v", err)
+	}
+
+	logText := string(got)
+	if !strings.Contains(logText, "=== API WEBSOCKET TIMELINE ===") {
+		t.Fatalf("streaming log missing API websocket timeline section: %s", logText)
+	}
+	if !strings.Contains(logText, "Event: api.websocket.request") {
+		t.Fatalf("streaming log missing websocket timeline event: %s", logText)
+	}
+	if !strings.Contains(logText, "Upstream Transport: websocket") {
+		t.Fatalf("streaming log missing websocket upstream transport: %s", logText)
 	}
 }

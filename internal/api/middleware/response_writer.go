@@ -306,6 +306,10 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		if len(apiResponse) > 0 {
 			_ = w.streamWriter.WriteAPIResponse(apiResponse)
 		}
+		apiWebsocketTimeline := w.extractAPIWebsocketTimeline(c)
+		if len(apiWebsocketTimeline) > 0 {
+			_ = w.streamWriter.WriteAPIWebsocketTimeline(apiWebsocketTimeline)
+		}
 		if err := w.streamWriter.Close(); err != nil {
 			w.streamWriter = nil
 			return err
