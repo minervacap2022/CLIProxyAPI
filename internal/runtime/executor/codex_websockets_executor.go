@@ -219,7 +219,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
-	helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
 		Headers:   wsHeaders.Clone(),
@@ -229,16 +229,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
-	})
+	}
+	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
-	if respHS != nil {
-		helps.RecordAPIWebsocketHandshake(ctx, e.cfg, respHS.StatusCode, respHS.Header.Clone())
-	}
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
-		if len(bodyErr) > 0 {
-			helps.AppendAPIWebsocketResponse(ctx, e.cfg, bodyErr)
+		if respHS != nil {
+			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
@@ -248,6 +246,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		return resp, errDial
+	}
+	if respHS != nil {
+		helps.RecordAPIWebsocketHandshake(ctx, e.cfg, respHS.StatusCode, respHS.Header.Clone())
 	}
 	closeHTTPResponseBody(respHS, "codex websockets executor: close handshake response body error")
 	if sess == nil {
@@ -413,7 +414,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
-	helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
 		Headers:   wsHeaders.Clone(),
@@ -423,18 +424,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
-	})
+	}
+	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 	var upstreamHeaders http.Header
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
-		helps.RecordAPIWebsocketHandshake(ctx, e.cfg, respHS.StatusCode, respHS.Header.Clone())
 	}
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
-		if len(bodyErr) > 0 {
-			helps.AppendAPIWebsocketResponse(ctx, e.cfg, bodyErr)
+		if respHS != nil {
+			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
@@ -447,6 +448,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			sess.reqMu.Unlock()
 		}
 		return nil, errDial
+	}
+	if respHS != nil {
+		helps.RecordAPIWebsocketHandshake(ctx, e.cfg, respHS.StatusCode, respHS.Header.Clone())
 	}
 	closeHTTPResponseBody(respHS, "codex websockets executor: close handshake response body error")
 
@@ -1020,6 +1024,23 @@ func encodeCodexWebsocketAsSSE(payload []byte) []byte {
 	line = append(line, []byte("data: ")...)
 	line = append(line, payload...)
 	return line
+}
+
+func websocketUpgradeRequestLog(info helps.UpstreamRequestLog) helps.UpstreamRequestLog {
+	upgradeInfo := info
+	upgradeInfo.Method = http.MethodGet
+	upgradeInfo.Body = nil
+	upgradeInfo.Headers = info.Headers.Clone()
+	if upgradeInfo.Headers == nil {
+		upgradeInfo.Headers = make(http.Header)
+	}
+	if strings.TrimSpace(upgradeInfo.Headers.Get("Connection")) == "" {
+		upgradeInfo.Headers.Set("Connection", "Upgrade")
+	}
+	if strings.TrimSpace(upgradeInfo.Headers.Get("Upgrade")) == "" {
+		upgradeInfo.Headers.Set("Upgrade", "websocket")
+	}
+	return upgradeInfo
 }
 
 func websocketHandshakeBody(resp *http.Response) []byte {

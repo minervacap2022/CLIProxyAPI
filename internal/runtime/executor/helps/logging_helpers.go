@@ -232,7 +232,6 @@ func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status
 	if ginCtx == nil {
 		return
 	}
-	markAPIResponseTimestamp(ginCtx)
 
 	builder := &strings.Builder{}
 	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
@@ -245,6 +244,24 @@ func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status
 	builder.WriteString("\n")
 
 	appendAPIWebsocketTimeline(ginCtx, []byte(builder.String()))
+}
+
+// RecordAPIWebsocketUpgradeRejection stores a rejected websocket upgrade as an HTTP attempt.
+func RecordAPIWebsocketUpgradeRejection(ctx context.Context, cfg *config.Config, info UpstreamRequestLog, status int, headers http.Header, body []byte) {
+	if cfg == nil || !cfg.RequestLog {
+		return
+	}
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx == nil {
+		return
+	}
+
+	if ginCtx.Keys != nil {
+		delete(ginCtx.Keys, apiWebsocketTimelineKey)
+	}
+	RecordAPIRequest(ctx, cfg, info)
+	RecordAPIResponseMetadata(ctx, cfg, status, headers)
+	AppendAPIResponseChunk(ctx, cfg, body)
 }
 
 // AppendAPIWebsocketResponse stores an upstream websocket response frame in Gin context.
