@@ -4,6 +4,7 @@
 package logging
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
@@ -807,12 +808,18 @@ func writeResponseSection(w io.Writer, statusCode int, statusWritten bool, respo
 		}
 	}
 
-	if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
-		return errWrite
+	var bufferedReader *bufio.Reader
+	if responseReader != nil {
+		bufferedReader = bufio.NewReader(responseReader)
+	}
+	if !responseBodyStartsWithLeadingNewline(bufferedReader) {
+		if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+			return errWrite
+		}
 	}
 
-	if responseReader != nil {
-		if _, errCopy := io.Copy(w, responseReader); errCopy != nil {
+	if bufferedReader != nil {
+		if _, errCopy := io.Copy(w, bufferedReader); errCopy != nil {
 			return errCopy
 		}
 	}
@@ -828,6 +835,19 @@ func writeResponseSection(w io.Writer, statusCode int, statusWritten bool, respo
 		}
 	}
 	return nil
+}
+
+func responseBodyStartsWithLeadingNewline(reader *bufio.Reader) bool {
+	if reader == nil {
+		return false
+	}
+	if peeked, _ := reader.Peek(2); len(peeked) >= 2 && peeked[0] == '\r' && peeked[1] == '\n' {
+		return true
+	}
+	if peeked, _ := reader.Peek(1); len(peeked) >= 1 && peeked[0] == '\n' {
+		return true
+	}
+	return false
 }
 
 // formatLogContent creates the complete log content for non-streaming requests.

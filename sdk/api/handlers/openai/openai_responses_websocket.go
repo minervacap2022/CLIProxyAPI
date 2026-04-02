@@ -61,6 +61,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	defer func() {
 		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
 		if wsTerminateErr != nil {
+			appendWebsocketTimelineDisconnect(&wsTimelineLog, wsTerminateErr, time.Now())
 			// log.Infof("responses websocket: session closing id=%s reason=%v", passthroughSessionID, wsTerminateErr)
 		} else {
 			log.Infof("responses websocket: session closing id=%s", passthroughSessionID)
@@ -127,7 +128,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if errMsg != nil {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			markAPIResponseTimestamp(c)
-			errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
+			errorPayload, errWrite := writeResponsesWebsocketError(conn, &wsTimelineLog, errMsg)
 			log.Infof(
 				"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 				passthroughSessionID,
@@ -144,7 +145,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				)
 				return
 			}
-			appendWebsocketTimelineEvent(&wsTimelineLog, "response", errorPayload, time.Now())
 			continue
 		}
 		if shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
@@ -610,7 +610,7 @@ func writeResponsesWebsocketSyntheticPrewarm(
 		// 	websocketPayloadEventType(payloads[i]),
 		// 	websocketPayloadPreview(payloads[i]),
 		// )
-		if errWrite := conn.WriteMessage(websocket.TextMessage, payloads[i]); errWrite != nil {
+		if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
 			log.Warnf(
 				"responses websocket: downstream_out write failed id=%s event=%s error=%v",
 				sessionID,
@@ -619,7 +619,6 @@ func writeResponsesWebsocketSyntheticPrewarm(
 			)
 			return errWrite
 		}
-		appendWebsocketTimelineEvent(wsTimelineLog, "response", payloads[i], time.Now())
 	}
 	return nil
 }
@@ -733,7 +732,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			if errMsg != nil {
 				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 				markAPIResponseTimestamp(c)
-				errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
+				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
 				log.Infof(
 					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 					sessionID,
@@ -751,7 +750,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					cancel(errMsg.Error)
 					return completedOutput, errWrite
 				}
-				appendWebsocketTimelineEvent(wsTimelineLog, "response", errorPayload, time.Now())
 			}
 			if errMsg != nil {
 				cancel(errMsg.Error)
@@ -768,7 +766,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					}
 					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 					markAPIResponseTimestamp(c)
-					errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
+					errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
 					log.Infof(
 						"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 						sessionID,
@@ -786,7 +784,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						cancel(errMsg.Error)
 						return completedOutput, errWrite
 					}
-					appendWebsocketTimelineEvent(wsTimelineLog, "response", errorPayload, time.Now())
 					cancel(errMsg.Error)
 					return completedOutput, nil
 				}
@@ -810,7 +807,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				// 	websocketPayloadEventType(payloads[i]),
 				// 	websocketPayloadPreview(payloads[i]),
 				// )
-				if errWrite := conn.WriteMessage(websocket.TextMessage, payloads[i]); errWrite != nil {
+				if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
 					log.Warnf(
 						"responses websocket: downstream_out write failed id=%s event=%s error=%v",
 						sessionID,
@@ -820,7 +817,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					cancel(errWrite)
 					return completedOutput, errWrite
 				}
-				appendWebsocketTimelineEvent(wsTimelineLog, "response", payloads[i], time.Now())
 			}
 		}
 	}
@@ -867,7 +863,7 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 	return payloads
 }
 
-func writeResponsesWebsocketError(conn *websocket.Conn, errMsg *interfaces.ErrorMessage) ([]byte, error) {
+func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog *strings.Builder, errMsg *interfaces.ErrorMessage) ([]byte, error) {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
 	if errMsg != nil {
@@ -937,7 +933,7 @@ func writeResponsesWebsocketError(conn *websocket.Conn, errMsg *interfaces.Error
 		}
 	}
 
-	return payload, conn.WriteMessage(websocket.TextMessage, payload)
+	return payload, writeResponsesWebsocketPayload(conn, wsTimelineLog, payload, time.Now())
 }
 
 func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []byte) {
@@ -989,6 +985,18 @@ func setWebsocketBody(c *gin.Context, key string, body string) {
 		return
 	}
 	c.Set(key, []byte(trimmedBody))
+}
+
+func writeResponsesWebsocketPayload(conn *websocket.Conn, wsTimelineLog *strings.Builder, payload []byte, timestamp time.Time) error {
+	appendWebsocketTimelineEvent(wsTimelineLog, "response", payload, timestamp)
+	return conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+func appendWebsocketTimelineDisconnect(builder *strings.Builder, err error, timestamp time.Time) {
+	if err == nil {
+		return
+	}
+	appendWebsocketTimelineEvent(builder, "disconnect", []byte(err.Error()), timestamp)
 }
 
 func appendWebsocketTimelineEvent(builder *strings.Builder, eventType string, payload []byte, timestamp time.Time) {

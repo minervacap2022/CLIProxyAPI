@@ -89,6 +89,29 @@ func TestWriteNonStreamingLog_HTTPKeepsRequestAndResponseSections(t *testing.T) 
 	}
 }
 
+func TestWriteResponseSection_PreservesLeadingCRLFInBody(t *testing.T) {
+	var out bytes.Buffer
+
+	err := writeResponseSection(
+		&out,
+		200,
+		true,
+		map[string][]string{"Content-Type": {"text/plain"}},
+		strings.NewReader("\r\nhello"),
+		nil,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("writeResponseSection error: %v", err)
+	}
+
+	got := out.String()
+	want := "=== RESPONSE ===\nStatus: 200\nContent-Type: text/plain\n\r\nhello\n"
+	if got != want {
+		t.Fatalf("writeResponseSection output = %q, want %q", got, want)
+	}
+}
+
 func TestWriteNonStreamingLog_APIWebsocketTimelineUsesDedicatedSection(t *testing.T) {
 	logger := &FileRequestLogger{}
 	var out bytes.Buffer
