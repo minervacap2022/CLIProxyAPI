@@ -47,6 +47,7 @@ type upstreamAttempt struct {
 	headersWritten       bool
 	bodyStarted          bool
 	bodyHasContent       bool
+	prevWasSSEEvent      bool
 	errorWritten         bool
 }
 
@@ -174,11 +175,18 @@ func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 		attempt.response.WriteString("Body:\n")
 		attempt.bodyStarted = true
 	}
+	currentChunkIsSSEEvent := bytes.HasPrefix(data, []byte("event:"))
+	currentChunkIsSSEData := bytes.HasPrefix(data, []byte("data:"))
 	if attempt.bodyHasContent {
-		attempt.response.WriteString("\n\n")
+		separator := "\n\n"
+		if attempt.prevWasSSEEvent && currentChunkIsSSEData {
+			separator = "\n"
+		}
+		attempt.response.WriteString(separator)
 	}
 	attempt.response.WriteString(string(data))
 	attempt.bodyHasContent = true
+	attempt.prevWasSSEEvent = currentChunkIsSSEEvent
 
 	updateAggregatedResponse(ginCtx, attempts)
 }
