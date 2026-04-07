@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,26 @@ import (
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type ClaudeExecutor struct {
 	cfg *config.Config
+}
+
+// parseAnthropicRetryAfter extracts the exact reset duration from Anthropic rate-limit headers.
+// Anthropic sends "anthropic-ratelimit-unified-reset" as a Unix timestamp (seconds) on 429 responses.
+// Returns nil if the header is absent or unparseable.
+func parseAnthropicRetryAfter(header http.Header) *time.Duration {
+	resetStr := header.Get("anthropic-ratelimit-unified-reset")
+	if resetStr == "" {
+		return nil
+	}
+	resetUnix, err := strconv.ParseInt(resetStr, 10, 64)
+	if err != nil {
+		return nil
+	}
+	resetTime := time.Unix(resetUnix, 0)
+	d := time.Until(resetTime)
+	if d <= 0 {
+		return nil
+	}
+	return &d
 }
 
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
@@ -215,7 +236,11 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		sErr := statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if httpResp.StatusCode == 429 {
+			sErr.retryAfter = parseAnthropicRetryAfter(httpResp.Header)
+		}
+		err = sErr
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
@@ -382,11 +407,14 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		sErr := statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if httpResp.StatusCode == 429 {
+			sErr.retryAfter = parseAnthropicRetryAfter(httpResp.Header)
+		}
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return nil, err
+		return nil, sErr
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
 	if err != nil {

@@ -118,7 +118,7 @@ func (e *modelAwareExecutor) Models() []string {
 
 // setupGroupHandler sets up a Manager + BaseAPIHandler with the given executor and registers
 // models in the global registry under a single auth entry.
-func setupGroupHandler(t *testing.T, exec *modelAwareExecutor, modelIDs ...string) *BaseAPIHandler {
+func setupGroupHandler(t *testing.T, exec coreauth.ProviderExecutor, modelIDs ...string) *BaseAPIHandler {
 	t.Helper()
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(exec)
@@ -200,6 +200,115 @@ func TestIsQuotaExhausted_NilError(t *testing.T) {
 func TestIsQuotaExhausted_PlainError(t *testing.T) {
 	if isQuotaExhausted(errors.New("something went wrong")) {
 		t.Error("expected plain error to not be quota-exhausted")
+	}
+}
+
+func TestIsQuotaExhausted_DeadlineExceeded(t *testing.T) {
+	// context.DeadlineExceeded means the upstream timed out — treat as failover signal.
+	if !isQuotaExhausted(context.DeadlineExceeded) {
+		t.Error("expected context.DeadlineExceeded to trigger failover")
+	}
+}
+
+func TestIsQuotaExhausted_ContextCanceled(t *testing.T) {
+	// context.Canceled means the client disconnected — must NOT trigger failover.
+	if isQuotaExhausted(context.Canceled) {
+		t.Error("expected context.Canceled NOT to trigger failover")
+	}
+}
+
+// deadlineExecutor returns context.DeadlineExceeded for models in the deadlineModels set.
+type deadlineExecutor struct {
+	modelAwareExecutor
+}
+
+func newDeadlineExecutor(deadlineModels ...string) *deadlineExecutor {
+	e := &deadlineExecutor{}
+	e.quotaModels = make(map[string]bool)
+	for _, m := range deadlineModels {
+		e.quotaModels[m] = true
+	}
+	return e
+}
+
+func (e *deadlineExecutor) Execute(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
+	e.mu.Lock()
+	e.calls = append(e.calls, req.Model)
+	e.mu.Unlock()
+	if e.quotaModels[req.Model] {
+		return coreexecutor.Response{}, context.DeadlineExceeded
+	}
+	return coreexecutor.Response{Payload: []byte(req.Model)}, nil
+}
+
+func (e *deadlineExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls = append(e.calls, req.Model)
+	e.mu.Unlock()
+	if e.quotaModels[req.Model] {
+		return nil, context.DeadlineExceeded
+	}
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch <- coreexecutor.StreamChunk{Payload: []byte(req.Model)}
+	close(ch)
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func TestExecuteWithAuthManager_DeadlineExceeded_Failover(t *testing.T) {
+	/*
+	 * primary (priority 2) returns context.DeadlineExceeded (upstream timeout).
+	 * Expect failover to backup (priority 1).
+	 */
+	exec := newDeadlineExecutor("primary-model")
+	handler := setupGroupHandler(t, exec, "primary-model", "backup-model")
+
+	mg := &internalconfig.ModelGroup{
+		Name: "timeout-group",
+		Models: []internalconfig.ModelGroupEntry{
+			{Model: "primary-model", Priority: 2},
+			{Model: "backup-model", Priority: 1},
+		},
+	}
+	kc := &internalconfig.APIKeyConfig{Key: "k", ModelGroup: "timeout-group"}
+	ctx := ctxWithGinKeyConfigs(kc, mg)
+
+	payload, _, errMsg := handler.ExecuteWithAuthManager(ctx, "openai", "timeout-group", []byte(`{}`), "")
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	if string(payload) != "backup-model" {
+		t.Errorf("expected failover to 'backup-model', got %q", payload)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_DeadlineExceeded_Failover(t *testing.T) {
+	/*
+	 * primary (priority 2) returns context.DeadlineExceeded on stream open.
+	 * Expect failover to backup (priority 1).
+	 */
+	exec := newDeadlineExecutor("primary-model")
+	handler := setupGroupHandler(t, exec, "primary-model", "backup-model")
+
+	mg := &internalconfig.ModelGroup{
+		Name: "stream-timeout-group",
+		Models: []internalconfig.ModelGroupEntry{
+			{Model: "primary-model", Priority: 2},
+			{Model: "backup-model", Priority: 1},
+		},
+	}
+	kc := &internalconfig.APIKeyConfig{Key: "k", ModelGroup: "stream-timeout-group"}
+	ctx := ctxWithGinKeyConfigs(kc, mg)
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "stream-timeout-group", []byte(`{}`), "")
+	var chunks []byte
+	for b := range dataChan {
+		chunks = append(chunks, b...)
+	}
+	if err := <-errChan; err != nil {
+		t.Fatalf("unexpected error: %v", err.Error)
+	}
+	if string(chunks) != "backup-model" {
+		t.Errorf("expected stream failover to 'backup-model', got %q", chunks)
 	}
 }
 

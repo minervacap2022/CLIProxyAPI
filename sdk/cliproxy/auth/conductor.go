@@ -1877,19 +1877,41 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							backoffLevel := state.Quota.BackoffLevel
 							if result.RetryAfter != nil {
 								next = now.Add(*result.RetryAfter)
+								// Anthropic quota is account-scoped: lock all models on this auth.
+								// The triggering model (state) is included in auth.ModelStates,
+								// so no separate per-model write is needed after this loop.
+								for _, ms := range auth.ModelStates {
+									if ms != nil {
+										ms.Unavailable = true
+										if ms.Status != StatusDisabled {
+											ms.Status = StatusError
+										}
+										ms.NextRetryAfter = next
+										ms.Quota = QuotaState{
+											Exceeded:      true,
+											Reason:        "quota",
+											NextRecoverAt: next,
+											BackoffLevel:  ms.Quota.BackoffLevel,
+										}
+									}
+								}
+								auth.Quota.Exceeded = true
+								auth.Quota.Reason = "quota"
+								auth.Quota.NextRecoverAt = next
+								auth.NextRetryAfter = next
 							} else {
 								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
 								if cooldown > 0 {
 									next = now.Add(cooldown)
 								}
 								backoffLevel = nextLevel
-							}
-							state.NextRetryAfter = next
-							state.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "quota",
-								NextRecoverAt: next,
-								BackoffLevel:  backoffLevel,
+								state.NextRetryAfter = next
+								state.Quota = QuotaState{
+									Exceeded:      true,
+									Reason:        "quota",
+									NextRecoverAt: next,
+									BackoffLevel:  backoffLevel,
+								}
 							}
 							suspendReason = "quota"
 							shouldSuspendModel = true

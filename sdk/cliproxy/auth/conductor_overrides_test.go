@@ -560,3 +560,104 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
 	}
 }
+
+// TestManager_MarkResult_429WithRetryAfter_LocksAllModels verifies that when a 429
+// result carries a RetryAfter duration (i.e. Anthropic's exact quota-reset timestamp),
+// every ModelState on that auth — not just the failing model — is locked until the
+// reset time.  This reflects the fact that Anthropic quota is account-scoped.
+func TestManager_MarkResult_429WithRetryAfter_LocksAllModels(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-quota",
+		Provider: "claude",
+		ModelStates: map[string]*ModelState{
+			"claude-opus-4-5":    {Status: StatusActive},
+			"claude-sonnet-4-6":  {Status: StatusActive},
+			"claude-haiku-4-5":   {Status: StatusActive},
+		},
+	}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	retryAfter := 5 * time.Hour
+	m.MarkResult(context.Background(), Result{
+		AuthID:     auth.ID,
+		Provider:   auth.Provider,
+		Model:      "claude-opus-4-5",
+		Success:    false,
+		Error:      &Error{HTTPStatus: 429, Message: "quota exceeded"},
+		RetryAfter: &retryAfter,
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("auth not found after MarkResult")
+	}
+
+	// Auth-level cooldown must be set.
+	if updated.NextRetryAfter.IsZero() {
+		t.Fatalf("auth.NextRetryAfter should be set for account-level quota exhaustion")
+	}
+
+	// Every model state must be locked, not just the one that triggered the 429.
+	for model, state := range updated.ModelStates {
+		if state == nil {
+			t.Fatalf("ModelState for %q is nil", model)
+		}
+		if !state.Unavailable {
+			t.Errorf("model %q: expected Unavailable=true, got false", model)
+		}
+		if state.NextRetryAfter.IsZero() {
+			t.Errorf("model %q: expected NextRetryAfter to be set, got zero", model)
+		}
+		if !state.Quota.Exceeded {
+			t.Errorf("model %q: expected Quota.Exceeded=true", model)
+		}
+	}
+}
+
+// TestManager_MarkResult_429WithoutRetryAfter_LocksOnlyTriggeredModel verifies that a
+// plain 429 (no RetryAfter, e.g. a transient rate-limit) only locks the model that
+// returned the error and leaves other models untouched.
+func TestManager_MarkResult_429WithoutRetryAfter_LocksOnlyTriggeredModel(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-ratelimit",
+		Provider: "claude",
+		ModelStates: map[string]*ModelState{
+			"claude-opus-4-5":   {Status: StatusActive},
+			"claude-sonnet-4-6": {Status: StatusActive},
+		},
+	}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "claude-opus-4-5",
+		Success:  false,
+		Error:    &Error{HTTPStatus: 429, Message: "rate limit"},
+		// RetryAfter intentionally nil — no Anthropic reset header.
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("auth not found after MarkResult")
+	}
+
+	opusState := updated.ModelStates["claude-opus-4-5"]
+	if opusState == nil || !opusState.Unavailable {
+		t.Errorf("opus: expected Unavailable=true")
+	}
+
+	// sonnet must NOT be locked.
+	sonnetState := updated.ModelStates["claude-sonnet-4-6"]
+	if sonnetState != nil && sonnetState.Unavailable {
+		t.Errorf("sonnet: expected Unavailable=false for plain rate-limit 429, got true")
+	}
+}

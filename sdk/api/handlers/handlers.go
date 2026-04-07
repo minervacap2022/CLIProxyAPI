@@ -6,6 +6,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -516,6 +517,13 @@ func isQuotaExhausted(err error) bool {
 	if authErr, ok := err.(*coreauth.Error); ok && authErr != nil {
 		return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
 	}
+	// Upstream deadline exceeded: the upstream connection timed out before responding.
+	// Treat as a transient failover signal (equivalent to 504 Gateway Timeout).
+	// context.Canceled is intentionally excluded — it indicates the client disconnected,
+	// not an upstream failure, so failover would be wasteful.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
 	return false
 }
 
@@ -550,6 +558,9 @@ func (h *BaseAPIHandler) executeWithModelGroup(ctx context.Context, handlerType 
 	var lastErr *interfaces.ErrorMessage
 
 	for _, tier := range tiers {
+		if ctx.Err() != nil {
+			break
+		}
 		for _, model := range tier.Models {
 			providers, normalizedModel, errMsg := h.getRequestDetails(model)
 			if errMsg != nil {
@@ -604,6 +615,9 @@ func (h *BaseAPIHandler) executeCountWithModelGroup(ctx context.Context, handler
 	var lastErr *interfaces.ErrorMessage
 
 	for _, tier := range tiers {
+		if ctx.Err() != nil {
+			break
+		}
 		for _, model := range tier.Models {
 			providers, normalizedModel, errMsg := h.getRequestDetails(model)
 			if errMsg != nil {
@@ -691,6 +705,9 @@ func (h *BaseAPIHandler) executeStreamWithModelGroup(ctx context.Context, handle
 		var lastErr *interfaces.ErrorMessage
 
 		for _, tier := range tiers {
+			if ctx.Err() != nil {
+				return
+			}
 			for _, model := range tier.Models {
 				providers, normalizedModel, errMsg := h.getRequestDetails(model)
 				if errMsg != nil {
