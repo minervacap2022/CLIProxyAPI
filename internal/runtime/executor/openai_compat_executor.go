@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -161,7 +160,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		sErr := statusErr{code: httpResp.StatusCode, msg: string(b)}
 		if httpResp.StatusCode == 429 {
-			sErr.retryAfter = parseRetryAfterHeader(httpResp.Header)
+			sErr.retryAfter = parseDoubaoRetryAfter(b)
 		}
 		err = sErr
 		return resp, err
@@ -266,7 +265,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		}
 		sErr := statusErr{code: httpResp.StatusCode, msg: string(b)}
 		if httpResp.StatusCode == 429 {
-			sErr.retryAfter = parseRetryAfterHeader(httpResp.Header)
+			sErr.retryAfter = parseDoubaoRetryAfter(b)
 		}
 		return nil, sErr
 	}
@@ -395,31 +394,40 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	return payload
 }
 
-// parseRetryAfterHeader extracts a retry-after duration from standard HTTP headers.
-// Checks "Retry-After" (seconds or HTTP-date) and OpenAI-style "x-ratelimit-reset-requests".
-// Returns nil if no usable header is found.
-func parseRetryAfterHeader(header http.Header) *time.Duration {
-	if v := header.Get("Retry-After"); v != "" {
-		// Try seconds first.
-		if secs, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && secs > 0 {
-			d := time.Duration(secs) * time.Second
-			return &d
-		}
-		// Try HTTP-date format.
-		if t, err := http.ParseTime(v); err == nil {
-			if d := time.Until(t); d > 0 {
-				return &d
-			}
-		}
+// parseDoubaoRetryAfter extracts the exact quota-reset duration from a Doubao/Volcengine
+// 429 response body.  Doubao embeds the reset timestamp in the error message:
+//
+//	{"error":{"message":"...It will reset at 2026-04-23 23:59:59 +0800 CST..."}}
+//
+// Returns nil if the pattern is absent or the timestamp is already in the past.
+// parseDoubaoRetryAfter extracts the exact quota-reset duration from a Doubao/Volcengine
+// 429 response body.  Doubao embeds the reset timestamp in the error message:
+//
+//	{"error":{"message":"...It will reset at 2026-04-23 23:59:59 +0800 CST. We recommend..."}}
+//
+// The timestamp is in CST (+0800). time.Until converts it to local time automatically.
+// Returns nil if the pattern is absent or the timestamp is already in the past.
+func parseDoubaoRetryAfter(body []byte) *time.Duration {
+	const prefix = "reset at "
+	msg := string(body)
+	idx := strings.Index(msg, prefix)
+	if idx == -1 {
+		return nil
 	}
-	// OpenAI-compatible providers (incl. Volcengine) may send x-ratelimit-reset-requests
-	// as a Unix timestamp (seconds).
-	if v := header.Get("x-ratelimit-reset-requests"); v != "" {
-		if ts, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
-			if d := time.Until(time.Unix(ts, 0)); d > 0 {
-				return &d
-			}
-		}
+	raw := strings.TrimSpace(msg[idx+len(prefix):])
+	// Timestamp ends at the first period or quote; take up to 32 chars as a safe upper bound.
+	end := strings.IndexAny(raw, ".\"")
+	if end == -1 {
+		end = len(raw)
+	}
+	raw = strings.TrimSpace(raw[:end])
+	// Doubao format: "2006-01-02 15:04:05 +0800 CST"
+	t, err := time.Parse("2006-01-02 15:04:05 -0700 MST", raw)
+	if err != nil {
+		return nil
+	}
+	if d := time.Until(t); d > 0 {
+		return &d
 	}
 	return nil
 }
