@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -158,7 +159,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		sErr := statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if httpResp.StatusCode == 429 {
+			sErr.retryAfter = parseRetryAfterHeader(httpResp.Header)
+		}
+		err = sErr
 		return resp, err
 	}
 	body, err := io.ReadAll(httpResp.Body)
@@ -259,8 +264,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return nil, err
+		sErr := statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if httpResp.StatusCode == 429 {
+			sErr.retryAfter = parseRetryAfterHeader(httpResp.Header)
+		}
+		return nil, sErr
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -385,6 +393,35 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+// parseRetryAfterHeader extracts a retry-after duration from standard HTTP headers.
+// Checks "Retry-After" (seconds or HTTP-date) and OpenAI-style "x-ratelimit-reset-requests".
+// Returns nil if no usable header is found.
+func parseRetryAfterHeader(header http.Header) *time.Duration {
+	if v := header.Get("Retry-After"); v != "" {
+		// Try seconds first.
+		if secs, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && secs > 0 {
+			d := time.Duration(secs) * time.Second
+			return &d
+		}
+		// Try HTTP-date format.
+		if t, err := http.ParseTime(v); err == nil {
+			if d := time.Until(t); d > 0 {
+				return &d
+			}
+		}
+	}
+	// OpenAI-compatible providers (incl. Volcengine) may send x-ratelimit-reset-requests
+	// as a Unix timestamp (seconds).
+	if v := header.Get("x-ratelimit-reset-requests"); v != "" {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+			if d := time.Until(time.Unix(ts, 0)); d > 0 {
+				return &d
+			}
+		}
+	}
+	return nil
 }
 
 type statusErr struct {
