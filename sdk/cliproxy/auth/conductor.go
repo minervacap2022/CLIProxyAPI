@@ -509,37 +509,32 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 	}
 
 	availableByPriority := make(map[int][]*Auth)
-	cooldownCount := 0
 	var earliest time.Time
 	for _, candidate := range auths {
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
-		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		blocked, _, next := isAuthBlockedForModel(candidate, checkModel, now)
 		if !blocked {
 			priority := authPriority(candidate)
 			availableByPriority[priority] = append(availableByPriority[priority], candidate)
 			continue
 		}
-		if reason == blockReasonCooldown {
-			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
+		// Track earliest recovery across ALL block reasons (cooldown, rate-limit,
+		// payment error, etc.) so the caller always gets a meaningful retry hint.
+		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
 		}
 	}
 
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
-			providerForError := provider
-			if providerForError == "mixed" {
-				providerForError = ""
-			}
-			resetIn := earliest.Sub(now)
-			if resetIn < 0 {
-				resetIn = 0
-			}
-			return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+		providerForError := provider
+		if providerForError == "mixed" {
+			providerForError = ""
 		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		resetIn := earliest.Sub(now)
+		if resetIn < 0 {
+			resetIn = 0
+		}
+		return nil, newModelCooldownError(routeModel, providerForError, resetIn)
 	}
 
 	bestPriority := 0
