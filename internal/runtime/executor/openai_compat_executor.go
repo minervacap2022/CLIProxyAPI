@@ -394,43 +394,50 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	return payload
 }
 
-// parseDoubaoRetryAfter extracts the exact quota-reset duration from a Doubao/Volcengine
-// 429 response body.  Doubao embeds the reset timestamp in the error message:
+// parseDoubaoRetryAfter extracts the retry-after duration from a Doubao/Volcengine 429 body.
 //
-//	{"error":{"message":"...It will reset at 2026-04-23 23:59:59 +0800 CST..."}}
+// Two cases are handled:
 //
-// Returns nil if the pattern is absent or the timestamp is already in the past.
-// parseDoubaoRetryAfter extracts the exact quota-reset duration from a Doubao/Volcengine
-// 429 response body.  Doubao embeds the reset timestamp in the error message:
+//  1. AccountQuotaExceeded — body contains "reset at <timestamp>"; returns exact duration
+//     until that timestamp so the auth is locked precisely until the quota resets.
 //
-//	{"error":{"message":"...It will reset at 2026-04-23 23:59:59 +0800 CST. We recommend..."}}
+//  2. RequestBurstTooFast — Volcengine burst/ramp-up protection; returns a fixed short
+//     cooldown (doubaoB urstCooldown) instead of nil, which would otherwise trigger
+//     exponential backoff and create a retry storm.
 //
-// The timestamp is in CST (+0800). time.Until converts it to local time automatically.
-// Returns nil if the pattern is absent or the timestamp is already in the past.
+// Returns nil for all other 429 variants (exponential backoff applies).
 func parseDoubaoRetryAfter(body []byte) *time.Duration {
-	const prefix = "reset at "
+	// Case 1: exact quota reset timestamp
+	const resetPrefix = "reset at "
 	msg := string(body)
-	idx := strings.Index(msg, prefix)
-	if idx == -1 {
-		return nil
+	if idx := strings.Index(msg, resetPrefix); idx != -1 {
+		raw := strings.TrimSpace(msg[idx+len(resetPrefix):])
+		end := strings.IndexAny(raw, ".\"")
+		if end == -1 {
+			end = len(raw)
+		}
+		raw = strings.TrimSpace(raw[:end])
+		// Doubao format: "2006-01-02 15:04:05 +0800 CST"
+		if t, err := time.Parse("2006-01-02 15:04:05 -0700 MST", raw); err == nil {
+			if d := time.Until(t); d > 0 {
+				return &d
+			}
+		}
 	}
-	raw := strings.TrimSpace(msg[idx+len(prefix):])
-	// Timestamp ends at the first period or quote; take up to 32 chars as a safe upper bound.
-	end := strings.IndexAny(raw, ".\"")
-	if end == -1 {
-		end = len(raw)
-	}
-	raw = strings.TrimSpace(raw[:end])
-	// Doubao format: "2006-01-02 15:04:05 +0800 CST"
-	t, err := time.Parse("2006-01-02 15:04:05 -0700 MST", raw)
-	if err != nil {
-		return nil
-	}
-	if d := time.Until(t); d > 0 {
+
+	// Case 2: burst / ramp-up protection — short fixed cooldown to break retry storm
+	if strings.Contains(msg, "RequestBurstTooFast") {
+		d := doubaoBurstCooldown
 		return &d
 	}
+
 	return nil
 }
+
+// doubaoBurstCooldown is the fixed retry delay applied when Volcengine returns
+// RequestBurstTooFast. It is long enough to let burst protection clear, but short
+// enough not to cause noticeable downtime when the key is otherwise healthy.
+const doubaoBurstCooldown = 60 * time.Second
 
 type statusErr struct {
 	code       int

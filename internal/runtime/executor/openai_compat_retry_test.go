@@ -38,3 +38,19 @@ func TestParseDoubaoRetryAfter(t *testing.T) {
 		t.Error("expected nil for nil body")
 	}
 }
+
+func TestParseDoubaoRetryAfter_BurstTooFast(t *testing.T) {
+	body := []byte(`{"error":{"code":"RequestBurstTooFast","message":"System protection triggered by request burst. Please slow down traffic growth and increase requests gradually before retrying.","param":"","type":"TooManyRequests"}}`)
+	d := parseDoubaoRetryAfter(body)
+	if d == nil {
+		t.Fatal("expected non-nil duration for RequestBurstTooFast")
+	}
+	if *d != doubaoBurstCooldown {
+		t.Errorf("expected %v, got %v", doubaoBurstCooldown, *d)
+	}
+
+	// Unrelated 429 (e.g., generic rate limit) → still nil
+	if parseDoubaoRetryAfter([]byte(`{"error":{"code":"RateLimitExceeded","message":"too many requests"}}`)) != nil {
+		t.Error("expected nil for unrecognized 429 code")
+	}
+}

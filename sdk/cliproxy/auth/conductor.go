@@ -1877,28 +1877,41 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							backoffLevel := state.Quota.BackoffLevel
 							if result.RetryAfter != nil {
 								next = now.Add(*result.RetryAfter)
-								// Anthropic quota is account-scoped: lock all models on this auth.
-								// The triggering model (state) is included in auth.ModelStates,
-								// so no separate per-model write is needed after this loop.
-								for _, ms := range auth.ModelStates {
-									if ms != nil {
-										ms.Unavailable = true
-										if ms.Status != StatusDisabled {
-											ms.Status = StatusError
-										}
-										ms.NextRetryAfter = next
-										ms.Quota = QuotaState{
-											Exceeded:      true,
-											Reason:        "quota",
-											NextRecoverAt: next,
-											BackoffLevel:  ms.Quota.BackoffLevel,
+								// Only lock all models on this auth when the cooldown is long enough
+								// to indicate an account-level quota exhaustion (e.g. Anthropic or
+								// Doubao AccountQuotaExceeded).  Short durations (≤ 10 min) are
+								// per-model burst/rate-limit signals (e.g. Doubao RequestBurstTooFast)
+								// and should only affect the triggering model's state.
+								if *result.RetryAfter > 10*time.Minute {
+									for _, ms := range auth.ModelStates {
+										if ms != nil {
+											ms.Unavailable = true
+											if ms.Status != StatusDisabled {
+												ms.Status = StatusError
+											}
+											ms.NextRetryAfter = next
+											ms.Quota = QuotaState{
+												Exceeded:      true,
+												Reason:        "quota",
+												NextRecoverAt: next,
+												BackoffLevel:  ms.Quota.BackoffLevel,
+											}
 										}
 									}
+									auth.Quota.Exceeded = true
+									auth.Quota.Reason = "quota"
+									auth.Quota.NextRecoverAt = next
+									auth.NextRetryAfter = next
+								} else {
+									// Short cooldown: per-model only (burst protection, not quota).
+									state.NextRetryAfter = next
+									state.Quota = QuotaState{
+										Exceeded:      true,
+										Reason:        "rate_limit",
+										NextRecoverAt: next,
+										BackoffLevel:  backoffLevel,
+									}
 								}
-								auth.Quota.Exceeded = true
-								auth.Quota.Reason = "quota"
-								auth.Quota.NextRecoverAt = next
-								auth.NextRetryAfter = next
 							} else {
 								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
 								if cooldown > 0 {
