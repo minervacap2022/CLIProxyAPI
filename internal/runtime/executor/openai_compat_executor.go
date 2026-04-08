@@ -437,7 +437,7 @@ func parseDoubaoRetryAfter(body []byte) *time.Duration {
 // doubaoBurstCooldown is the fixed retry delay applied when Volcengine returns
 // RequestBurstTooFast. It is long enough to let burst protection clear, but short
 // enough not to cause noticeable downtime when the key is otherwise healthy.
-const doubaoBurstCooldown = 60 * time.Second
+const doubaoBurstCooldown = 15 * time.Second
 
 type statusErr struct {
 	code       int
