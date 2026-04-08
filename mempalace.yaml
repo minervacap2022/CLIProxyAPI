@@ -1,0 +1,28 @@
+wing: cliproxyapi
+rooms:
+- name: auths
+  description: Files from auths/
+- name: testing
+  description: Files from test/
+- name: internal
+  description: Files from internal/
+- name: documentation
+  description: Files from docs/
+- name: cmd
+  description: Files from cmd/
+- name: sdk
+  description: Files from sdk/
+- name: design
+  description: Files from assets/
+- name: examples
+  description: Files from examples/
+- name: panel
+  description: Files from panel/
+- name: skills
+  description: Files from skills/
+- name: backend
+  description: Files from api/
+- name: configuration
+  description: Files from config/
+- name: general
+  description: Files that don't fit other rooms

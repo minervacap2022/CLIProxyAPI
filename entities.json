@@ -1,0 +1,18 @@
+{
+  "people": [
+    "User",
+    "English"
+  ],
+  "projects": [
+    "Gemini",
+    "Amp",
+    "Content",
+    "Provider",
+    "Agent",
+    "Service",
+    "Claude",
+    "Config",
+    "Pro",
+    "Doubao"
+  ]
+}
