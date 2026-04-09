@@ -361,11 +361,11 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
 }
 
-// mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
+// mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown error
+// when every candidate across the listed providers is blocked for any reason.
 func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, tried map[string]struct{}) error {
 	now := time.Now()
 	total := 0
-	cooldownCount := 0
 	earliest := time.Time{}
 	for _, providerKey := range providers {
 		providerState := s.providers[providerKey]
@@ -376,9 +376,8 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if shard == nil {
 			continue
 		}
-		localTotal, localCooldownCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried))
+		localTotal, _, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried))
 		total += localTotal
-		cooldownCount += localCooldownCount
 		if !localEarliest.IsZero() && (earliest.IsZero() || localEarliest.Before(earliest)) {
 			earliest = localEarliest
 		}
@@ -386,11 +385,7 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	resetIn := earliest.Sub(now)
-	if resetIn < 0 {
-		resetIn = 0
-	}
-	return newModelCooldownError(model, "", resetIn)
+	return makeCooldownError(model, "", earliest, now)
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
@@ -771,24 +766,16 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 	return len(bucket.all.flat)
 }
 
-// unavailableErrorLocked returns the cooldown error for the shard. When every
-// candidate is unavailable for any reason (cooldown, rate-limit, payment error,
-// etc.), callers always get a 429 model_cooldown with the earliest recovery time.
+// unavailableErrorLocked returns a 429 model_cooldown error for the shard.
+// When every candidate is blocked for any reason (cooldown, rate-limit,
+// payment error, etc.), callers get the earliest recovery time as a retry hint.
 func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool) error {
 	now := time.Now()
 	total, _, earliest := m.availabilitySummaryLocked(predicate)
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	providerForError := provider
-	if providerForError == "mixed" {
-		providerForError = ""
-	}
-	resetIn := earliest.Sub(now)
-	if resetIn < 0 {
-		resetIn = 0
-	}
-	return newModelCooldownError(model, providerForError, resetIn)
+	return makeCooldownError(model, provider, earliest, now)
 }
 
 // availabilitySummaryLocked summarizes total candidates, cooldown count, and earliest retry time.

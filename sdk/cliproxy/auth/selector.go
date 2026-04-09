@@ -44,6 +44,17 @@ type modelCooldownError struct {
 	provider string
 }
 
+// makeCooldownError builds the canonical model_cooldown error for a set of
+// blocked auths: it normalises the internal "mixed" provider marker to an
+// empty string and derives the retry duration from the earliest recovery time.
+// newModelCooldownError already clamps negative durations.
+func makeCooldownError(model, provider string, earliest, now time.Time) *modelCooldownError {
+	if provider == "mixed" {
+		provider = ""
+	}
+	return newModelCooldownError(model, provider, earliest.Sub(now))
+}
+
 func newModelCooldownError(model, provider string, resetIn time.Duration) *modelCooldownError {
 	if resetIn < 0 {
 		resetIn = 0
@@ -191,7 +202,10 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+// collectAvailableByPriority groups unblocked auths by priority and tracks the
+// earliest recovery time across all blocked auths so callers can surface a
+// meaningful retry hint when nothing is available.
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
@@ -201,14 +215,11 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 			available[priority] = append(available[priority], candidate)
 			continue
 		}
-		// Track earliest recovery across ALL block reasons (cooldown, rate-limit,
-		// payment error, etc.) so the caller always gets a meaningful retry hint.
-		cooldownCount++
 		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 			earliest = next
 		}
 	}
-	return available, cooldownCount, earliest
+	return available, earliest
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -216,17 +227,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, _, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, earliest := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
-		providerForError := provider
-		if providerForError == "mixed" {
-			providerForError = ""
-		}
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return nil, newModelCooldownError(model, providerForError, resetIn)
+		return nil, makeCooldownError(model, provider, earliest, now)
 	}
 
 	bestPriority := 0

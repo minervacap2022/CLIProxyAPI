@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -512,9 +513,16 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 		t.Fatalf("expected terminal error")
 	}
 	// When all auths are blocked, the system returns 429 model_cooldown
-	// instead of 503 auth_unavailable.
+	// with a retry hint instead of 503 auth_unavailable.
 	if gotErr.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusTooManyRequests)
+	}
+	errText := gotErr.Error.Error()
+	if !strings.Contains(errText, "model_cooldown") {
+		t.Fatalf("expected model_cooldown in error, got %q", errText)
+	}
+	if !strings.Contains(errText, "test-model") {
+		t.Fatalf("expected model name in error, got %q", errText)
 	}
 
 	if executor.Calls() != 1 {

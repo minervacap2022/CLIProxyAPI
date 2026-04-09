@@ -604,15 +604,7 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 	}
 
 	if len(availableByPriority) == 0 {
-		providerForError := provider
-		if providerForError == "mixed" {
-			providerForError = ""
-		}
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+		return nil, makeCooldownError(routeModel, provider, earliest, now)
 	}
 
 	bestPriority := 0
