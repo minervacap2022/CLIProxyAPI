@@ -195,17 +195,17 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
-		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
+		blocked, _, next := isAuthBlockedForModel(candidate, model, now)
 		if !blocked {
 			priority := authPriority(candidate)
 			available[priority] = append(available[priority], candidate)
 			continue
 		}
-		if reason == blockReasonCooldown {
-			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
+		// Track earliest recovery across ALL block reasons (cooldown, rate-limit,
+		// payment error, etc.) so the caller always gets a meaningful retry hint.
+		cooldownCount++
+		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
 		}
 	}
 	return available, cooldownCount, earliest
@@ -216,20 +216,17 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, _, earliest := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
-			providerForError := provider
-			if providerForError == "mixed" {
-				providerForError = ""
-			}
-			resetIn := earliest.Sub(now)
-			if resetIn < 0 {
-				resetIn = 0
-			}
-			return nil, newModelCooldownError(model, providerForError, resetIn)
+		providerForError := provider
+		if providerForError == "mixed" {
+			providerForError = ""
 		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		resetIn := earliest.Sub(now)
+		if resetIn < 0 {
+			resetIn = 0
+		}
+		return nil, newModelCooldownError(model, providerForError, resetIn)
 	}
 
 	bestPriority := 0

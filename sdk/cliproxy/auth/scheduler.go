@@ -386,14 +386,11 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if cooldownCount == total && !earliest.IsZero() {
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return newModelCooldownError(model, "", resetIn)
+	resetIn := earliest.Sub(now)
+	if resetIn < 0 {
+		resetIn = 0
 	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return newModelCooldownError(model, "", resetIn)
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
@@ -774,25 +771,24 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 	return len(bucket.all.flat)
 }
 
-// unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
+// unavailableErrorLocked returns the cooldown error for the shard. When every
+// candidate is unavailable for any reason (cooldown, rate-limit, payment error,
+// etc.), callers always get a 429 model_cooldown with the earliest recovery time.
 func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool) error {
 	now := time.Now()
-	total, cooldownCount, earliest := m.availabilitySummaryLocked(predicate)
+	total, _, earliest := m.availabilitySummaryLocked(predicate)
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if cooldownCount == total && !earliest.IsZero() {
-		providerForError := provider
-		if providerForError == "mixed" {
-			providerForError = ""
-		}
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return newModelCooldownError(model, providerForError, resetIn)
+	providerForError := provider
+	if providerForError == "mixed" {
+		providerForError = ""
 	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	resetIn := earliest.Sub(now)
+	if resetIn < 0 {
+		resetIn = 0
+	}
+	return newModelCooldownError(model, providerForError, resetIn)
 }
 
 // availabilitySummaryLocked summarizes total candidates, cooldown count, and earliest retry time.
@@ -811,12 +807,13 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		if entry == nil || entry.auth == nil {
 			continue
 		}
-		if entry.state != scheduledStateCooldown {
-			continue
-		}
-		cooldownCount++
-		if !entry.nextRetryAt.IsZero() && (earliest.IsZero() || entry.nextRetryAt.Before(earliest)) {
-			earliest = entry.nextRetryAt
+		// Count ALL blocked states (cooldown + blocked) as unavailable, and track
+		// earliest recovery time across all of them so callers always get a retry hint.
+		if entry.state == scheduledStateCooldown || entry.state == scheduledStateBlocked {
+			cooldownCount++
+			if !entry.nextRetryAt.IsZero() && (earliest.IsZero() || entry.nextRetryAt.Before(earliest)) {
+				earliest = entry.nextRetryAt
+			}
 		}
 	}
 	return total, cooldownCount, earliest
