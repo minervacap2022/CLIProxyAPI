@@ -938,7 +938,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		baseBetas += ",interleaved-thinking-2025-05-14"
 	}
 
-	// Merge extra betas from request body.
+	// Merge extra betas from request body and request flags.
 	if len(extraBetas) > 0 {
 		existingSet := make(map[string]bool)
 		for _, b := range strings.Split(baseBetas, ",") {
