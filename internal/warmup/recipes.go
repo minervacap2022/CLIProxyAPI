@@ -33,25 +33,33 @@ type Recipe struct {
 // recipes lists the built-in warmup recipes keyed by lower-case provider.
 // Only OAuth-capable providers with a known minimal body are populated.
 //
-// When adding a new provider, pick the cheapest available model and set
-// max_tokens / maxOutputTokens to 1 so the warmup has negligible cost.
+// Payload shape rationale:
+//   - input text "ping" instead of "."  — looks like normal greeting traffic
+//     rather than a single punctuation mark; reduces risk of Anthropic flagging
+//     warmup hits as abnormal patterns.
+//   - max_tokens=16 instead of 1  — some providers only start the session
+//     window once a non-trivial completion has actually been generated; 16 is
+//     still cheap on Haiku/Flash-Lite tiers (sub-cent per round) but gives the
+//     model room to produce a real reply rather than an immediate stop.
+//
+// When adding a new provider, keep the same philosophy: cheapest model, small
+// but not degenerate prompt, max-output in the 8–32 range.
 var recipes = map[string]Recipe{
 	// Claude OAuth (Max plan) — the primary motivation for warmup.
-	// A single-byte user message with max_tokens=1 against the cheapest
-	// Haiku tier is sufficient to open the 5-hour session window.
+	// "ping" with max_tokens=16 against the cheapest Haiku tier opens the
+	// 5-hour session window reliably while keeping cost negligible.
 	"claude": {
 		Provider:     "claude",
 		Model:        "claude-haiku-4-5",
 		SourceFormat: sdktranslator.FromString("claude"),
-		Payload:      []byte(`{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"."}]}`),
+		Payload:      []byte(`{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`),
 	},
-	// Codex OAuth (ChatGPT-login). Uses the /v1/responses API under
-	// Anthropic's lightest Codex model.
+	// Codex OAuth (ChatGPT-login). Uses the /v1/responses API.
 	"codex": {
 		Provider:     "codex",
 		Model:        "gpt-5",
 		SourceFormat: sdktranslator.FromString("codex"),
-		Payload:      []byte(`{"model":"gpt-5","input":".","max_output_tokens":16,"store":false}`),
+		Payload:      []byte(`{"model":"gpt-5","input":"ping","max_output_tokens":16,"store":false}`),
 	},
 	// Gemini OAuth family — all translate from Gemini native payload.
 	// gemini-2.5-flash-lite is the cheapest current generation model.
@@ -59,32 +67,32 @@ var recipes = map[string]Recipe{
 		Provider:     "gemini",
 		Model:        "gemini-2.5-flash-lite",
 		SourceFormat: sdktranslator.FromString("gemini"),
-		Payload:      []byte(`{"contents":[{"role":"user","parts":[{"text":"."}]}],"generationConfig":{"maxOutputTokens":1}}`),
+		Payload:      []byte(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16}}`),
 	},
 	"gemini-cli": {
 		Provider:     "gemini-cli",
 		Model:        "gemini-2.5-flash-lite",
 		SourceFormat: sdktranslator.FromString("gemini"),
-		Payload:      []byte(`{"contents":[{"role":"user","parts":[{"text":"."}]}],"generationConfig":{"maxOutputTokens":1}}`),
+		Payload:      []byte(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16}}`),
 	},
 	"aistudio": {
 		Provider:     "aistudio",
 		Model:        "gemini-2.5-flash-lite",
 		SourceFormat: sdktranslator.FromString("gemini"),
-		Payload:      []byte(`{"contents":[{"role":"user","parts":[{"text":"."}]}],"generationConfig":{"maxOutputTokens":1}}`),
+		Payload:      []byte(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16}}`),
 	},
 	"vertex": {
 		Provider:     "vertex",
 		Model:        "gemini-2.5-flash-lite",
 		SourceFormat: sdktranslator.FromString("gemini"),
-		Payload:      []byte(`{"contents":[{"role":"user","parts":[{"text":"."}]}],"generationConfig":{"maxOutputTokens":1}}`),
+		Payload:      []byte(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16}}`),
 	},
 	// Antigravity uses the Claude payload schema.
 	"antigravity": {
 		Provider:     "antigravity",
 		Model:        "claude-haiku-4-5",
 		SourceFormat: sdktranslator.FromString("claude"),
-		Payload:      []byte(`{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"."}]}`),
+		Payload:      []byte(`{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`),
 	},
 	// Kimi — OAuth-backed but rarely has strict session windows. Kept here
 	// so future operators can opt in; executor uses OpenAI format.
@@ -92,7 +100,7 @@ var recipes = map[string]Recipe{
 		Provider:     "kimi",
 		Model:        "kimi-k2-turbo-preview",
 		SourceFormat: sdktranslator.FromString("openai"),
-		Payload:      []byte(`{"model":"kimi-k2-turbo-preview","max_tokens":1,"messages":[{"role":"user","content":"."}]}`),
+		Payload:      []byte(`{"model":"kimi-k2-turbo-preview","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`),
 	},
 }
 
