@@ -441,6 +441,16 @@ func (s *Server) setupRoutes() {
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
+// ManagementHandler exposes the management handler so external code (e.g. the
+// cliproxy service) can wire auxiliary controllers such as the warmup scheduler.
+// Returns nil when the server was initialised without management.
+func (s *Server) ManagementHandler() *managementHandlers.Handler {
+	if s == nil {
+		return nil
+	}
+	return s.mgmt
+}
+
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
 // The handler is served as-is without additional middleware beyond the standard stack already configured.
 func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
@@ -525,6 +535,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
+
+		mgmt.GET("/warmup", s.mgmt.GetWarmup)
+		mgmt.PUT("/warmup", s.mgmt.PutWarmup)
+		mgmt.PATCH("/warmup", s.mgmt.PutWarmup)
+		mgmt.POST("/warmup/trigger", s.mgmt.TriggerWarmup)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)

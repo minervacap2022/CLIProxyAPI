@@ -216,6 +216,19 @@ func (s *Scheduler) Start(parent context.Context) {
 	}
 }
 
+// TriggerNow fires a single warmup round synchronously with the given reason.
+// Useful for management-API "warm now" endpoints and integration tests.
+// Reason defaults to "manual" when empty.
+func (s *Scheduler) TriggerNow(ctx context.Context, reason string) {
+	if s == nil || s.mgr == nil {
+		return
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "manual"
+	}
+	s.runRound(ctx, reason)
+}
+
 // Stop cancels the scheduler and waits for all in-flight goroutines to exit.
 // Safe to call multiple times and on a nil scheduler.
 func (s *Scheduler) Stop() {

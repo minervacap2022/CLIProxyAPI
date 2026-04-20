@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -54,6 +55,25 @@ type Handler struct {
 	 * It is optional; when nil the change takes effect after the next file-watcher reload.
 	 */
 	keyConfigRefreshFunc func()
+
+	// warmupController is an optional hook to restart / trigger the warmup
+	// scheduler when the warmup config is mutated via the management API.
+	warmupController WarmupController
+}
+
+// WarmupController abstracts the warmup scheduler so management handlers can
+// trigger rounds or ask the service to reload the scheduler after config
+// updates without introducing a hard dependency on internal/warmup.
+type WarmupController interface {
+	// TriggerNow runs a single warmup round synchronously.
+	TriggerNow(ctx context.Context, reason string)
+	// Reload applies the current config.Warmup settings — stops the previous
+	// scheduler and starts a new one using the cfg.Warmup values. Errors are
+	// returned for invalid configs so the management API can surface them.
+	Reload() error
+	// SupportedProviders returns the provider keys that have a warmup recipe
+	// registered, for surfacing in the management UI.
+	SupportedProviders() []string
 }
 
 // NewHandler creates a new management handler instance.
@@ -159,6 +179,15 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 // rebuild its in-memory lookup indexes.
 func (h *Handler) SetKeyConfigRefreshFunc(f func()) {
 	h.keyConfigRefreshFunc = f
+}
+
+// SetWarmupController wires the warmup scheduler into the management handler
+// so operators can trigger rounds and reload the scheduler after config edits.
+// Passing nil clears the controller (warmup endpoints will return 503).
+func (h *Handler) SetWarmupController(ctrl WarmupController) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.warmupController = ctrl
 }
 
 // Middleware enforces access control for management endpoints.

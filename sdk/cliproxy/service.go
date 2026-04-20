@@ -94,6 +94,78 @@ type Service struct {
 	// warmupScheduler fires proactive warmup requests against OAuth auths to
 	// open provider session windows before real traffic arrives.
 	warmupScheduler *warmup.Scheduler
+
+	// warmupCtx is the parent context handed to the warmup scheduler.
+	// It survives across Reload calls so reloaded schedulers share lifetime.
+	warmupCtx context.Context
+
+	// warmupMu guards warmupScheduler replacements during Reload.
+	warmupMu sync.Mutex
+}
+
+// warmupAdapter bridges the management-handler WarmupController interface and
+// the concrete scheduler, so internal/api/handlers/management does not depend
+// on internal/warmup.
+type warmupAdapter struct {
+	svc *Service
+}
+
+func (a *warmupAdapter) TriggerNow(ctx context.Context, reason string) {
+	if a == nil || a.svc == nil {
+		return
+	}
+	a.svc.warmupMu.Lock()
+	sched := a.svc.warmupScheduler
+	a.svc.warmupMu.Unlock()
+	if sched == nil {
+		return
+	}
+	sched.TriggerNow(ctx, reason)
+}
+
+func (a *warmupAdapter) SupportedProviders() []string {
+	return warmup.SupportedProviders()
+}
+
+// Reload parses the current cfg.Warmup, stops the previous scheduler and
+// launches a new one with the updated settings. Safe to call concurrently.
+func (a *warmupAdapter) Reload() error {
+	if a == nil || a.svc == nil {
+		return errors.New("cliproxy: service unavailable")
+	}
+	svc := a.svc
+	svc.cfgMu.RLock()
+	cfg := svc.cfg
+	svc.cfgMu.RUnlock()
+	if cfg == nil {
+		return errors.New("cliproxy: config unavailable")
+	}
+	wopts, err := warmup.ParseOptions(cfg.Warmup)
+	if err != nil {
+		return err
+	}
+
+	svc.warmupMu.Lock()
+	prev := svc.warmupScheduler
+	svc.warmupScheduler = nil
+	svc.warmupMu.Unlock()
+	if prev != nil {
+		prev.Stop()
+	}
+	if wopts == nil {
+		// Warmup disabled — nothing more to do.
+		return nil
+	}
+	ctx := svc.warmupCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	newSched := warmup.NewScheduler(svc.coreManager, *wopts)
+	newSched.Start(ctx)
+	svc.warmupMu.Lock()
+	svc.warmupScheduler = newSched
+	svc.warmupMu.Unlock()
+	return nil
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -723,11 +795,20 @@ func (s *Service) Run(ctx context.Context) error {
 	// The scheduler inherits the service context so Stop is called automatically
 	// if Shutdown is bypassed (e.g. panic in shutdownOnce).
 	if s.coreManager != nil {
+		s.warmupCtx = ctx
 		if wopts, wErr := warmup.ParseOptions(s.cfg.Warmup); wErr != nil {
 			log.Warnf("warmup scheduler disabled: invalid config: %v", wErr)
 		} else if wopts != nil {
 			s.warmupScheduler = warmup.NewScheduler(s.coreManager, *wopts)
 			s.warmupScheduler.Start(ctx)
+		}
+		// Wire the management API to the warmup subsystem (always, so even when
+		// disabled today the operator can flip Enabled via the UI and get a live
+		// scheduler without restarting).
+		if s.server != nil {
+			if mh := s.server.ManagementHandler(); mh != nil {
+				mh.SetWarmupController(&warmupAdapter{svc: s})
+			}
 		}
 	}
 
