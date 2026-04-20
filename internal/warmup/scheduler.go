@@ -132,9 +132,16 @@ func ParseOptions(cfg config.WarmupConfig) (*Options, error) {
 
 // Executor is the subset of *coreauth.Manager the scheduler depends on.
 // Defining it locally keeps the scheduler testable without the full manager.
+//
+// We intentionally call the provider executor directly (rather than going
+// through Manager.Execute) so warmup bypasses the model-registry filter.
+// Warmup requests target a specific OAuth auth + a known cheap model; the
+// Manager's "does this auth advertise support for this model" gate does not
+// reflect upstream API availability and was rejecting legitimate warmup
+// traffic when operators pinned their auths to a custom model list.
 type Executor interface {
 	List() []*coreauth.Auth
-	Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error)
+	Executor(provider string) (coreauth.ProviderExecutor, bool)
 }
 
 // Scheduler fires warmup requests on interval + start-time triggers.
@@ -374,6 +381,12 @@ func (s *Scheduler) warmOne(ctx context.Context, auth *coreauth.Auth, trigger, r
 		"started_utc": time.Now().UTC().Format(time.RFC3339),
 	})
 
+	providerExec, hasExec := s.mgr.Executor(provider)
+	if !hasExec || providerExec == nil {
+		entry.Warn("warmup skipped: provider executor not registered")
+		return false
+	}
+
 	reqCtx, cancel := context.WithTimeout(ctx, s.opts.Timeout)
 	defer cancel()
 
@@ -396,7 +409,7 @@ func (s *Scheduler) warmOne(ctx context.Context, auth *coreauth.Auth, trigger, r
 	}
 
 	start := s.now()
-	_, err := s.mgr.Execute(reqCtx, []string{provider}, req, execOpts)
+	_, err := providerExec.Execute(reqCtx, auth, req, execOpts)
 	dur := time.Since(start)
 	if err != nil {
 		fields := log.Fields{"duration": dur.String(), "error": err.Error()}

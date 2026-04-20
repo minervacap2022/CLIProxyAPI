@@ -3,6 +3,7 @@ package warmup
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,7 +14,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
-// fakeExecutor records each Execute call for assertions.
+// fakeExecutor records each provider-executor Execute call for assertions.
 type fakeExecutor struct {
 	mu    sync.Mutex
 	auths []*coreauth.Auth
@@ -37,19 +38,45 @@ func (f *fakeExecutor) List() []*coreauth.Auth {
 	return out
 }
 
-func (f *fakeExecutor) Execute(_ context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	f.calls.Add(1)
-	c := seenCall{model: req.Model}
-	if len(providers) > 0 {
-		c.provider = providers[0]
+func (f *fakeExecutor) Executor(provider string) (coreauth.ProviderExecutor, bool) {
+	return &fakeProviderExecutor{parent: f, provider: provider}, true
+}
+
+// fakeProviderExecutor implements coreauth.ProviderExecutor minimally, recording
+// the auth ID and model passed by the scheduler.
+type fakeProviderExecutor struct {
+	parent   *fakeExecutor
+	provider string
+}
+
+func (p *fakeProviderExecutor) Identifier() string { return p.provider }
+
+func (p *fakeProviderExecutor) Execute(_ context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	p.parent.calls.Add(1)
+	c := seenCall{provider: p.provider, model: req.Model}
+	if auth != nil {
+		c.authID = auth.ID
 	}
-	if id, ok := opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey].(string); ok {
-		c.authID = id
-	}
-	f.mu.Lock()
-	f.seen = append(f.seen, c)
-	f.mu.Unlock()
-	return cliproxyexecutor.Response{}, f.err
+	p.parent.mu.Lock()
+	p.parent.seen = append(p.parent.seen, c)
+	p.parent.mu.Unlock()
+	return cliproxyexecutor.Response{}, p.parent.err
+}
+
+func (p *fakeProviderExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (p *fakeProviderExecutor) Refresh(context.Context, *coreauth.Auth) (*coreauth.Auth, error) {
+	return nil, nil
+}
+
+func (p *fakeProviderExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (p *fakeProviderExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
 }
 
 func oauthAuth(id, provider string) *coreauth.Auth {
