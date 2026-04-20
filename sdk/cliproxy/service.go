@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/warmup"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -89,6 +90,10 @@ type Service struct {
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
+
+	// warmupScheduler fires proactive warmup requests against OAuth auths to
+	// open provider session windows before real traffic arrives.
+	warmupScheduler *warmup.Scheduler
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -713,6 +718,19 @@ func (s *Service) Run(ctx context.Context) error {
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 
+	// Start OAuth warmup scheduler if configured. Failures are logged and do
+	// not block server startup — warmup is a latency optimization, not critical.
+	// The scheduler inherits the service context so Stop is called automatically
+	// if Shutdown is bypassed (e.g. panic in shutdownOnce).
+	if s.coreManager != nil {
+		if wopts, wErr := warmup.ParseOptions(s.cfg.Warmup); wErr != nil {
+			log.Warnf("warmup scheduler disabled: invalid config: %v", wErr)
+		} else if wopts != nil {
+			s.warmupScheduler = warmup.NewScheduler(s.coreManager, *wopts)
+			s.warmupScheduler.Start(ctx)
+		}
+	}
+
 	select {
 	case <-ctx.Done():
 		log.Debug("service context cancelled, shutting down...")
@@ -743,6 +761,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		// legacy refresh loop removed; only stopping core auth manager below
 
+		if s.warmupScheduler != nil {
+			s.warmupScheduler.Stop()
+		}
 		if s.watcherCancel != nil {
 			s.watcherCancel()
 		}

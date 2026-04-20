@@ -94,6 +94,46 @@ disable-cooling: false
 # When > 0, overrides the default worker count (16).
 # auth-auto-refresh-workers: 16
 
+# OAuth warmup scheduler.
+#
+# Proactively fires a minimal request against OAuth-backed auths so the
+# provider session window opens before real traffic arrives. Primary use
+# case: Claude Max's 5-hour session window — fire a warmup at a scheduled
+# time (start-at) so the 5h window aligns with working hours.
+#
+# Warmup NEVER runs against API-key auths (they have no session window).
+# Auths are only warmed when they carry an OAuth access_token or email.
+#
+# Supported providers: claude, codex, gemini, gemini-cli, aistudio, vertex,
+# antigravity, kimi.
+#
+# Audit logs: every round emits structured logrus fields (round_id, trigger,
+# auth_id, provider, model, duration, ok/fail counts, http_status on error).
+#
+# warmup:
+#   enabled: false
+#   # Fire once immediately when the service starts.
+#   on-startup: true
+#   # 轮询预热: fire every N duration per auth. Minimum 15m; empty disables.
+#   interval: "4h30m"
+#   # 定时预热: fire daily at time-of-day HH:MM (24h). Empty disables.
+#   start-at: "08:50"
+#   # IANA timezone that start-at is interpreted in. Default: Asia/Shanghai
+#   # (UTC+8). The scheduler converts to the system's local time automatically.
+#   timezone: "Asia/Shanghai"
+#   # Optional allowlist. Empty = all supported providers above.
+#   providers: [claude]
+#   # Optional per-provider model override. Keys are lowercase provider names.
+#   # When unset, each provider's built-in cheapest model is used.
+#   models:
+#     claude: claude-haiku-4-5
+#     codex: gpt-5
+#     gemini: gemini-2.5-flash-lite
+#   # Max concurrent warmup calls (default: 2).
+#   concurrency: 2
+#   # Per-call timeout (default: 30s).
+#   timeout: "30s"
+
 # Quota exceeded behavior
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded

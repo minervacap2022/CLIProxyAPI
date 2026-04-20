@@ -148,7 +148,54 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// Warmup configures proactive session-window warmup for OAuth auths.
+	// Useful for providers like Claude Max (5-hour session window) where the
+	// first request starts the billing/quota window; firing a minimal warmup
+	// request early lets operators align the session window with working hours
+	// or refresh it periodically.
+	Warmup WarmupConfig `yaml:"warmup,omitempty" json:"warmup,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// WarmupConfig controls the OAuth warmup scheduler.
+//
+// Warmup fires a minimal API request against each eligible OAuth auth to open
+// the provider session window before real traffic arrives. It is a no-op when
+// Enabled is false. Warmup never runs against API-key (not-OAuth) auths.
+type WarmupConfig struct {
+	// Enabled toggles the warmup scheduler.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Interval fires a warmup for each eligible auth every N duration
+	// (e.g. "4h30m"). Empty or <=0 disables interval-based warmup.
+	// Polling / 轮询预热 setting.
+	Interval string `yaml:"interval,omitempty" json:"interval,omitempty"`
+	// StartAt fires a daily warmup at the specified time-of-day "HH:MM"
+	// (24h clock). Empty disables daily warmup. Useful to start the Claude
+	// 5-hour session window aligned with work hours.
+	// Scheduled / 定时预热 setting.
+	StartAt string `yaml:"start-at,omitempty" json:"start-at,omitempty"`
+	// Timezone names the IANA zone that StartAt is interpreted in. When empty,
+	// defaults to "Asia/Shanghai" (UTC+8). The server converts the resulting
+	// instant to system local time at runtime — so you always write the wall
+	// clock time you care about (e.g. "08:50") and the server does the math.
+	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
+	// OnStartup fires a single warmup round when the service starts.
+	OnStartup bool `yaml:"on-startup,omitempty" json:"on-startup,omitempty"`
+	// Providers optionally restricts warmup to the listed provider keys
+	// (e.g. ["claude", "codex"]). Empty list means all supported providers.
+	Providers []string `yaml:"providers,omitempty" json:"providers,omitempty"`
+	// Models overrides the default warmup model per provider (keyed by
+	// lower-case provider name). When unset, built-in recipe defaults are used.
+	// Example:
+	//   models:
+	//     claude: claude-haiku-4-5
+	//     gemini: gemini-2.5-flash-lite
+	Models map[string]string `yaml:"models,omitempty" json:"models,omitempty"`
+	// Concurrency caps concurrent warmup calls; defaults to 2 when <=0.
+	Concurrency int `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
+	// Timeout limits each warmup request (e.g. "30s"); defaults to 30s when empty.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
