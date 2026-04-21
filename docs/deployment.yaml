@@ -1,0 +1,561 @@
+# CLIProxyAPI deployment runbook — single-file, agent-consumable spec.
+#
+# This file is the only input the deploy agent needs. It is self-contained:
+# every `run:` block is self-contained bash. The only artifacts the pipeline
+# writes to disk are docker-inspect snapshots and a few state files under
+# `config.artifacts_dir/state/`. No helper scripts, no /bin/. Everything else
+# is `docker` + `jq` + `curl` inline.
+#
+# Editing policy (to keep it stable + reusable + maintainable):
+#   * Per-service values live ONLY in `config:` and `targets:`.
+#     Everything else (pipeline/rollback/helpers) is service-agnostic.
+#   * When reusing for another service: duplicate this file, edit `config:`
+#     and `targets:` and `checks:`. Do not touch `pipeline:` / `helpers:`.
+#   * Never inline literal paths/ports/container names inside `pipeline.*.run`.
+#     Reference them via `{{config.X}}` / `{{target.X}}` so drift stays in
+#     one place.
+#
+# ==============================================================================
+# Agent contract — read before executing.
+# ==============================================================================
+#
+# Substitution:
+#   {{config.X}}        → value from `config:` block, substituted BEFORE shell.
+#   {{target.X}}        → field of the current target (shadow or primary),
+#                         substituted BEFORE shell.
+#   {{artifacts.X}}     → shorthand for `{{config.artifacts_dir}}/X`.
+#   $VAR / $(cmd)       → native shell. Do NOT substitute.
+#
+# Step types (exactly one per step):
+#   run: |               → bash block; step fails iff `bash -euo pipefail` fails.
+#   run_checks: [ids]    → run each listed id from `checks:` against `target`.
+#                          Step fails on first failing check.
+#   requires_user_confirmation: true → pause, surface `confirm.*`, wait for
+#                          operator token. Pipeline MUST NOT auto-accept.
+#
+# Step modifiers (optional, any number):
+#   env: {KEY: VALUE}    → exported to bash before `run:` fires. Values go
+#                          through `{{...}}` substitution first, then shell
+#                          (so `$(cmd)` inside a value is evaluated by bash).
+#
+# YAML anchors:
+#   Reusable bash blocks live under `snippets:` as anchors (`&name`). A step
+#   references them with `run: *name`. The parsed YAML duplicates the body
+#   per call site, so agents do not need to resolve anchors specially — but
+#   the source file stays DRY.
+#
+# Control flow:
+#   Steps run top-to-bottom. First failing step triggers `on_failure` (a path
+#   like `rollback.shadow_revert`) and then aborts the whole pipeline.
+#   If no `on_failure` is set, the pipeline aborts without rollback — the
+#   operator must intervene.
+#
+# Idempotency:
+#   Steps are idempotent unless marked `idempotent: false`. The agent MAY
+#   re-run idempotent steps on retry; non-idempotent steps require operator
+#   approval to re-run.
+
+schema_version: 2
+
+# ==============================================================================
+# Editable configuration. Change these per service / per host.
+# ==============================================================================
+config:
+  service_name: cliproxyapi
+  repo_remote: "git@github.com:minervacap2022/CLIProxyAPI.git"   # EDIT: canonical remote
+  repo_dir: /home/yaodong/Workspace/CLIProxyAPI                  # EDIT: clone path on deploy host
+  repo_main_branch: main
+  artifacts_dir: /tmp/cliproxyapi-deploy                         # snapshots, helpers, state
+  image_repo: cliproxyapi                                        # tag namespace for builds
+  health_path: /healthz
+  management_path: /management.html
+  api_key: ""                                                    # EDIT: test key for smoke checks (never a prod key)
+  # Globs used to classify diff paths. Anything matching frontend_paths
+  # triggers a frontend rebuild; anything not in docs_paths triggers backend.
+  frontend_paths:  ["panel/", "management.html"]
+  docs_paths:      ["docs/", "*.md"]
+  backend_test_command: "go test -race ./internal/thinking/... ./internal/runtime/executor/... ./internal/api/modules/amp/..."
+  wait_healthy_timeout_seconds: 30
+  rollback_window_hours: 24
+
+# ==============================================================================
+# Targets. Keep `primary` last in rollout order.
+# ==============================================================================
+targets:
+
+  shadow:
+    container: cliproxyapi-shadow
+    host: localhost
+    host_port: 8319
+    traffic_role: canary
+
+  primary:
+    container: cliproxyapi
+    host: localhost
+    host_port: 8318
+    traffic_role: live
+
+# ==============================================================================
+# Reusable checks. Each check runs against a single `target` (set by the
+# calling `run_checks` step). Use `expect` OR `expect_contains` OR
+# `expect_not_contains` — exactly one.
+# ==============================================================================
+checks:
+
+  healthz:
+    description: "GET /healthz returns 200 with status=ok"
+    run: |
+      curl -fsS "http://{{target.host}}:{{target.host_port}}{{config.health_path}}"
+    expect_contains: '"status":"ok"'
+
+  management_panel:
+    description: "management HTML is served"
+    run: |
+      curl -fsS -o /dev/null -w '%{http_code}\n' \
+        "http://{{target.host}}:{{target.host_port}}{{config.management_path}}"
+    expect: "200"
+
+  models_list:
+    description: "GET /v1/models returns a list"
+    run: |
+      curl -fsS "http://{{target.host}}:{{target.host_port}}/v1/models" \
+        -H "x-api-key: {{config.api_key}}"
+    expect_contains: '"object":"list"'
+
+  minimal_messages:
+    description: "POST /v1/messages round-trip with cheapest model"
+    run: |
+      curl -fsS -X POST "http://{{target.host}}:{{target.host_port}}/v1/messages" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: {{config.api_key}}" \
+        -d '{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}'
+    expect_contains: '"type":"message"'
+
+  regression_kimi_to_opus:
+    description: |
+      Regression guard for commit 77c2992a. Replays an assistant history
+      with an unsigned thinking block (Kimi-shaped) and asserts the proxy
+      strips it instead of returning 400.
+    run: |
+      cat <<'PAYLOAD' | curl -sS -X POST \
+        "http://{{target.host}}:{{target.host_port}}/v1/messages" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: {{config.api_key}}" \
+        --data @-
+      {"model":"claude-haiku-4-5","max_tokens":32,"messages":[
+        {"role":"user","content":[{"type":"text","text":"ping"}]},
+        {"role":"assistant","content":[
+          {"type":"thinking","thinking":"stale reasoning"},
+          {"type":"text","text":"pong"}
+        ]},
+        {"role":"user","content":[{"type":"text","text":"continue"}]}
+      ]}
+      PAYLOAD
+    expect_not_contains: "Invalid `signature` in `thinking` block"
+
+  log_error_scan:
+    description: "last 100 container log lines contain no error/panic/fatal"
+    run: |
+      docker logs --tail 100 "{{target.container}}" 2>&1 \
+        | grep -iE 'error|panic|fatal' || true
+    expect: ""
+
+# ==============================================================================
+# Snippets. Anchored bash bodies referenced via `run: *name`. The parsed YAML
+# duplicates the body at every call site — this block is the single source.
+# Call sites MUST set the required env vars via `env:` on the same step.
+# ==============================================================================
+snippets:
+
+  rehydrate_container: &rehydrate_container |
+    # Rebuild a container from a `docker inspect` snapshot, replacing only
+    # the image. Fails closed if any critical field is missing.
+    # Requires env: SNAPSHOT, NAME, IMAGE
+    set -euo pipefail
+    : "${SNAPSHOT:?env SNAPSHOT required}"
+    : "${NAME:?env NAME required}"
+    : "${IMAGE:?env IMAGE required}"
+    test -s "$SNAPSHOT" || { echo "empty snapshot: $SNAPSHOT" >&2; exit 2; }
+
+    args=(run -d --name "$NAME")
+    restart=$(jq -r '.[0].HostConfig.RestartPolicy.Name // empty' "$SNAPSHOT")
+    [ -n "$restart" ] && [ "$restart" != "no" ] && args+=(--restart "$restart")
+    net=$(jq -r '.[0].HostConfig.NetworkMode // empty' "$SNAPSHOT")
+    [ -n "$net" ] && [ "$net" != "default" ] && [ "$net" != "bridge" ] && args+=(--network "$net")
+
+    while IFS= read -r e; do [ -n "$e" ] && args+=(-e "$e"); done \
+      < <(jq -r '.[0].Config.Env // [] | .[]' "$SNAPSHOT")
+    while IFS= read -r p; do [ -n "$p" ] && args+=(-p "$p"); done \
+      < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[] | .key as $c | .value[]? | "\(.HostPort):\($c|split("/")[0])"' "$SNAPSHOT")
+    while IFS= read -r m; do [ -n "$m" ] && args+=(-v "$m"); done \
+      < <(jq -r '.[0].Mounts // [] | .[] | if (.Mode // "") == "" then "\(.Source):\(.Destination)" else "\(.Source):\(.Destination):\(.Mode)" end' "$SNAPSHOT")
+
+    entry=$(jq -r '.[0].Config.Entrypoint // [] | .[0] // empty' "$SNAPSHOT")
+    [ -n "$entry" ] && args+=(--entrypoint "$entry")
+
+    args+=("$IMAGE")
+    while IFS= read -r c; do [ -n "$c" ] && args+=("$c"); done \
+      < <(jq -r '.[0].Config.Cmd // [] | .[]' "$SNAPSHOT")
+
+    printf '+ docker' >&2
+    printf ' %q' "${args[@]}" >&2
+    printf '\n' >&2
+    exec docker "${args[@]}"
+
+  diff_runtime: &diff_runtime |
+    # Diff the runtime-relevant subset of two `docker inspect` snapshots.
+    # Exits 0 iff identical on env / ports / mounts / entrypoint / cmd /
+    # restart policy / network mode.
+    # Requires env: BEFORE, AFTER
+    set -euo pipefail
+    : "${BEFORE:?env BEFORE required}"
+    : "${AFTER:?env AFTER required}"
+
+    project='{
+      env:        (.[0].Config.Env // [] | sort),
+      ports:      (.[0].HostConfig.PortBindings // {}),
+      mounts:     (.[0].Mounts // [] | map({Source,Destination,Mode,RW,Type}) | sort_by(.Destination)),
+      entrypoint: (.[0].Config.Entrypoint // []),
+      cmd:        (.[0].Config.Cmd // []),
+      restart:    (.[0].HostConfig.RestartPolicy // {}),
+      network:    (.[0].HostConfig.NetworkMode // "")
+    }'
+    b=$(mktemp) a=$(mktemp)
+    trap 'rm -f "$b" "$a"' EXIT
+    jq -S "$project" "$BEFORE" > "$b"
+    jq -S "$project" "$AFTER"  > "$a"
+    if ! diff -u "$b" "$a"; then
+      echo "runtime params drifted — refusing to continue" >&2
+      exit 1
+    fi
+
+
+# ==============================================================================
+# Pipeline. Phases run top-to-bottom.
+# ==============================================================================
+pipeline:
+
+  phases:
+
+    # -----------------------------------------------------------------------
+    - id: prepare
+      description: "create artifacts dir (runs every deploy, idempotent)"
+      steps:
+        - id: prepare_dirs
+          run: mkdir -p "{{config.artifacts_dir}}/state"
+
+    # -----------------------------------------------------------------------
+    - id: scope
+      description: "sync repo, detect what changed since last deploy"
+      steps:
+        - id: sync_repo
+          run: |
+            cd "{{config.repo_dir}}"
+            git fetch origin
+            git checkout "{{config.repo_main_branch}}"
+            git pull --ff-only origin "{{config.repo_main_branch}}"
+          verify: git -C "{{config.repo_dir}}" rev-parse HEAD
+
+        - id: detect_scope
+          description: |
+            Classify the diff between the deployed SHA and HEAD. Emits
+            scope.json = {deployed_sha, new_sha, frontend, backend}. If no
+            prior deploy is recorded, both flags default to true.
+          run: |
+            cd "{{config.repo_dir}}"
+            DEPLOYED=$(cat "{{config.artifacts_dir}}/state/last_deployed_sha" 2>/dev/null || true)
+            NEW=$(git rev-parse HEAD)
+            frontend=false; backend=false
+            if [ -z "$DEPLOYED" ]; then
+              frontend=true; backend=true
+            else
+              while IFS= read -r path; do
+                [ -z "$path" ] && continue
+                case "$path" in
+                  panel/*|*/management.html|management.html) frontend=true ;;
+                esac
+                case "$path" in
+                  docs/*|*.md) ;;                  # docs only
+                  panel/*|*/management.html|management.html) ;;  # frontend
+                  *) backend=true ;;
+                esac
+              done <<< "$(git diff --name-only "$DEPLOYED" "$NEW" || true)"
+            fi
+            printf '{"deployed_sha":"%s","new_sha":"%s","frontend":%s,"backend":%s}\n' \
+              "$DEPLOYED" "$NEW" "$frontend" "$backend" \
+              | tee "{{config.artifacts_dir}}/state/scope.json"
+          verify: test -s "{{config.artifacts_dir}}/state/scope.json"
+
+    # -----------------------------------------------------------------------
+    - id: capture
+      description: "snapshot current container params — source of truth for rehydrate"
+      steps:
+        - id: snapshot_shadow
+          run: |
+            docker inspect "{{targets.shadow.container}}" \
+              > "{{config.artifacts_dir}}/state/shadow_before.json"
+          verify: test -s "{{config.artifacts_dir}}/state/shadow_before.json"
+
+        - id: snapshot_primary
+          run: |
+            docker inspect "{{targets.primary.container}}" \
+              > "{{config.artifacts_dir}}/state/primary_before.json"
+          verify: test -s "{{config.artifacts_dir}}/state/primary_before.json"
+
+        - id: record_previous_image
+          run: |
+            docker inspect "{{targets.primary.container}}" \
+              --format '{{`{{.Config.Image}}`}}' \
+              > "{{config.artifacts_dir}}/state/previous_image_tag"
+          verify: test -s "{{config.artifacts_dir}}/state/previous_image_tag"
+
+    # -----------------------------------------------------------------------
+    - id: build
+      description: "rebuild only what changed (frontend and/or backend)"
+      steps:
+        - id: run_backend_tests
+          when: '$(jq -r .backend "{{config.artifacts_dir}}/state/scope.json") == true'
+          run: |
+            cd "{{config.repo_dir}}"
+            {{config.backend_test_command}}
+          on_failure: abort
+
+        - id: build_frontend
+          when: '$(jq -r .frontend "{{config.artifacts_dir}}/state/scope.json") == true'
+          description: |
+            Frontend source lives in a sibling repo (minervacap2022/Cli-Proxy-API-Management-Center).
+            This step is a placeholder — the docker.yml workflow shows the
+            reference build. EDIT to match your local frontend workflow.
+          run: |
+            echo "EDIT: insert frontend build commands here" >&2
+            test -s "{{config.repo_dir}}/panel/management.html"
+
+        - id: build_image
+          run: |
+            cd "{{config.repo_dir}}"
+            SHORT=$(git rev-parse --short HEAD)
+            DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            docker build \
+              --build-arg VERSION="dev-${SHORT}" \
+              --build-arg COMMIT="$(git rev-parse HEAD)" \
+              --build-arg BUILD_DATE="${DATE}" \
+              --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+              -t "{{config.image_repo}}:dev-${SHORT}" \
+              -t "{{config.image_repo}}:dev-latest" \
+              .
+            echo "{{config.image_repo}}:dev-${SHORT}" \
+              > "{{config.artifacts_dir}}/state/new_image_tag"
+          verify: docker image inspect "$(cat {{config.artifacts_dir}}/state/new_image_tag)" >/dev/null
+
+    # -----------------------------------------------------------------------
+    - id: shadow_deploy
+      description: "deploy new image to shadow with identical startup params, verify"
+      steps:
+        - id: stop_shadow
+          run: docker stop "{{targets.shadow.container}}" || true
+
+        - id: remove_shadow
+          run: docker rm "{{targets.shadow.container}}" || true
+
+        - id: start_shadow
+          idempotent: false
+          env:
+            SNAPSHOT: "{{config.artifacts_dir}}/state/shadow_before.json"
+            NAME:     "{{targets.shadow.container}}"
+            IMAGE:    "$(cat {{config.artifacts_dir}}/state/new_image_tag)"
+          run: *rehydrate_container
+
+        - id: wait_healthy
+          run: |
+            for _ in $(seq 1 {{config.wait_healthy_timeout_seconds}}); do
+              curl -fsS "http://{{targets.shadow.host}}:{{targets.shadow.host_port}}{{config.health_path}}" \
+                >/dev/null && exit 0
+              sleep 1
+            done
+            exit 1
+          on_failure: rollback.shadow_revert
+
+        - id: snapshot_shadow_after
+          run: |
+            docker inspect "{{targets.shadow.container}}" \
+              > "{{config.artifacts_dir}}/state/shadow_after.json"
+
+        - id: verify_shadow_params
+          env:
+            BEFORE: "{{config.artifacts_dir}}/state/shadow_before.json"
+            AFTER:  "{{config.artifacts_dir}}/state/shadow_after.json"
+          run: *diff_runtime
+          on_failure: rollback.shadow_revert
+
+        - id: run_shadow_checks
+          run_checks:
+            - healthz
+            - management_panel
+            - models_list
+            - minimal_messages
+            - regression_kimi_to_opus
+            - log_error_scan
+          target: shadow
+          on_failure: rollback.shadow_revert
+
+    # -----------------------------------------------------------------------
+    - id: confirm_promotion
+      description: "human gate: confirm params unchanged, approve primary rollout"
+      steps:
+        - id: show_diff_and_wait
+          requires_user_confirmation: true
+          confirm:
+            prompt: |
+              Shadow healthy on port {{targets.shadow.host_port}}. Ready to
+              promote new image to primary ({{targets.primary.container}},
+              port {{targets.primary.host_port}}).
+              The primary will be rehydrated from primary_before.json —
+              startup params will be byte-identical to current.
+              Type one of `accept_tokens` to proceed, or any `reject_tokens`
+              to abort and revert shadow.
+            show:
+              - "{{config.artifacts_dir}}/state/scope.json"
+              - "{{config.artifacts_dir}}/state/primary_before.json"
+              - "{{config.artifacts_dir}}/state/new_image_tag"
+              - "{{config.artifacts_dir}}/state/previous_image_tag"
+              - "last run_shadow_checks output"
+            accept_tokens: ["yes", "y", "promote", "go"]
+            reject_tokens: ["no", "n", "abort", "stop"]
+          on_reject: rollback.shadow_revert
+
+    # -----------------------------------------------------------------------
+    - id: primary_deploy
+      description: "deploy new image to primary with identical startup params, verify"
+      steps:
+        - id: stop_primary
+          run: docker stop "{{targets.primary.container}}" || true
+
+        - id: remove_primary
+          run: docker rm "{{targets.primary.container}}" || true
+
+        - id: start_primary
+          idempotent: false
+          env:
+            SNAPSHOT: "{{config.artifacts_dir}}/state/primary_before.json"
+            NAME:     "{{targets.primary.container}}"
+            IMAGE:    "$(cat {{config.artifacts_dir}}/state/new_image_tag)"
+          run: *rehydrate_container
+
+        - id: wait_healthy
+          run: |
+            for _ in $(seq 1 {{config.wait_healthy_timeout_seconds}}); do
+              curl -fsS "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.health_path}}" \
+                >/dev/null && exit 0
+              sleep 1
+            done
+            exit 1
+          on_failure: rollback.primary_revert
+
+        - id: snapshot_primary_after
+          run: |
+            docker inspect "{{targets.primary.container}}" \
+              > "{{config.artifacts_dir}}/state/primary_after.json"
+
+        - id: verify_primary_params
+          env:
+            BEFORE: "{{config.artifacts_dir}}/state/primary_before.json"
+            AFTER:  "{{config.artifacts_dir}}/state/primary_after.json"
+          run: *diff_runtime
+          on_failure: rollback.primary_revert
+
+        - id: run_primary_checks
+          run_checks:
+            - healthz
+            - management_panel
+            - models_list
+            - minimal_messages
+            - regression_kimi_to_opus
+            - log_error_scan
+          target: primary
+          on_failure: rollback.primary_revert
+
+    # -----------------------------------------------------------------------
+    - id: record
+      description: "pin the deploy so next run's scope detection has a baseline"
+      steps:
+        - id: write_deployed_sha
+          run: |
+            git -C "{{config.repo_dir}}" rev-parse HEAD \
+              > "{{config.artifacts_dir}}/state/last_deployed_sha"
+
+        - id: log_rollback_window
+          run: |
+            printf '%s\t%s\t%s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              "$(cat {{config.artifacts_dir}}/state/previous_image_tag)" \
+              "$(cat {{config.artifacts_dir}}/state/new_image_tag)" \
+              >> "{{config.artifacts_dir}}/state/rollback_window.tsv"
+
+# ==============================================================================
+# Rollback procedures. Referenced by `on_failure` / `on_reject` above.
+# ==============================================================================
+rollback:
+
+  shadow_revert:
+    description: "restore previous image on shadow only (primary untouched)"
+    steps:
+      - run: docker stop "{{targets.shadow.container}}" || true
+      - run: docker rm   "{{targets.shadow.container}}" || true
+      - env:
+          SNAPSHOT: "{{config.artifacts_dir}}/state/shadow_before.json"
+          NAME:     "{{targets.shadow.container}}"
+          IMAGE:    "$(cat {{config.artifacts_dir}}/state/previous_image_tag)"
+        run: *rehydrate_container
+
+  primary_revert:
+    description: "primary went bad after promotion — restore previous image"
+    steps:
+      - run: docker stop "{{targets.primary.container}}" || true
+      - run: docker rm   "{{targets.primary.container}}" || true
+      - env:
+          SNAPSHOT: "{{config.artifacts_dir}}/state/primary_before.json"
+          NAME:     "{{targets.primary.container}}"
+          IMAGE:    "$(cat {{config.artifacts_dir}}/state/previous_image_tag)"
+        run: *rehydrate_container
+      - run: |
+          curl -fsS "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.health_path}}"
+
+  stop_all:
+    description: "emergency kill-switch — use only if primary is actively harmful"
+    steps:
+      - run: docker stop "{{targets.primary.container}}" "{{targets.shadow.container}}"
+
+# ==============================================================================
+# Observability — where to look when things fail.
+# ==============================================================================
+observability:
+  container_logs:
+    primary: 'docker logs -f --tail 200 "{{targets.primary.container}}"'
+    shadow:  'docker logs -f --tail 200 "{{targets.shadow.container}}"'
+  host_logs:
+    main:       "~/.cli-proxy-api/logs/main.log"
+    error_glob: "~/.cli-proxy-api/logs/error-v1-messages-*.log"
+  management_panel:
+    primary: "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.management_path}}"
+    shadow:  "http://{{targets.shadow.host}}:{{targets.shadow.host_port}}{{config.management_path}}"
+
+# ==============================================================================
+# Open questions. Fill in before the first real deploy; leaving any unresolved
+# should cause the agent to warn at `setup.prepare_dirs`.
+# ==============================================================================
+open_questions:
+  - id: prod_api_key
+    question: "Which API key does the agent use for smoke checks? Must be a low-privilege test key, not a prod key."
+    blocks: [checks.models_list, checks.minimal_messages, checks.regression_kimi_to_opus]
+
+  - id: native_processes_fate
+    question: "Retire the two root-owned ./CLIProxyAPI processes started 2026-04-20, or add a `native` target?"
+    blocks: []
+
+  - id: frontend_build_source
+    question: "Confirm frontend lives in sibling Cli-Proxy-API-Management-Center repo and fill build commands in pipeline.build.build_frontend."
+    blocks: [pipeline.build.build_frontend]
+
+  - id: artifacts_persistence
+    question: "Is `{{config.artifacts_dir}}` on tmpfs / /tmp? If yes, `last_deployed_sha` is lost on reboot — move to a persistent path."
+    blocks: []
