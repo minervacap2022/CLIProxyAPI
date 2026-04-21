@@ -180,6 +180,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 
+	// Drop thinking blocks with empty/missing/invalid signatures from assistant history.
+	// These are produced by non-Claude providers (e.g. Kimi) whose translators emit
+	// thinking blocks without signatures; replaying them to Anthropic triggers a 400
+	// "Invalid `signature` in `thinking` block" error.
+	body = thinking.SanitizeMessagesThinking(body)
+
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
@@ -368,6 +374,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
+
+	// See Execute() for rationale; same cross-provider thinking-block cleanup applies here.
+	body = thinking.SanitizeMessagesThinking(body)
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.

@@ -2,12 +2,12 @@ package amp
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -295,64 +295,10 @@ func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
 // array before forwarding to the upstream API.
 // This prevents 400 errors from the API which requires valid signatures on thinking
 // blocks and does not accept a signature field on tool_use blocks.
+//
+// The implementation lives in internal/thinking.SanitizeMessagesThinking so it can be
+// reused by other executors (e.g. ClaudeExecutor handles the same issue when clients
+// replay cross-provider history back to Anthropic).
 func SanitizeAmpRequestBody(body []byte) []byte {
-	messages := gjson.GetBytes(body, "messages")
-	if !messages.Exists() || !messages.IsArray() {
-		return body
-	}
-
-	modified := false
-	for msgIdx, msg := range messages.Array() {
-		if msg.Get("role").String() != "assistant" {
-			continue
-		}
-		content := msg.Get("content")
-		if !content.Exists() || !content.IsArray() {
-			continue
-		}
-
-		var keepBlocks []interface{}
-		contentModified := false
-
-		for _, block := range content.Array() {
-			blockType := block.Get("type").String()
-			if blockType == "thinking" {
-				sig := block.Get("signature")
-				if !sig.Exists() || sig.Type != gjson.String || strings.TrimSpace(sig.String()) == "" {
-					contentModified = true
-					continue
-				}
-			}
-
-			// Use raw JSON to prevent float64 rounding of large integers in tool_use inputs
-			blockRaw := []byte(block.Raw)
-			if blockType == "tool_use" && block.Get("signature").Exists() {
-				blockRaw, _ = sjson.DeleteBytes(blockRaw, "signature")
-				contentModified = true
-			}
-
-			// sjson.SetBytes supports raw JSON strings if wrapped in gjson.Raw
-			keepBlocks = append(keepBlocks, json.RawMessage(blockRaw))
-		}
-
-		if contentModified {
-			contentPath := fmt.Sprintf("messages.%d.content", msgIdx)
-			var err error
-			if len(keepBlocks) == 0 {
-				body, err = sjson.SetBytes(body, contentPath, []interface{}{})
-			} else {
-				body, err = sjson.SetBytes(body, contentPath, keepBlocks)
-			}
-			if err != nil {
-				log.Warnf("Amp RequestSanitizer: failed to sanitize message %d: %v", msgIdx, err)
-				continue
-			}
-			modified = true
-		}
-	}
-
-	if modified {
-		log.Debugf("Amp RequestSanitizer: sanitized request body")
-	}
-	return body
+	return thinking.SanitizeMessagesThinking(body)
 }
