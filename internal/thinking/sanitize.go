@@ -44,7 +44,21 @@ func SanitizeMessagesThinking(body []byte) []byte {
 			blockType := block.Get("type").String()
 			if blockType == "thinking" {
 				sig := block.Get("signature")
-				if !sig.Exists() || sig.Type != gjson.String || strings.TrimSpace(sig.String()) == "" {
+				if !sig.Exists() || sig.Type != gjson.String {
+					contentModified = true
+					continue
+				}
+				trimmed := strings.TrimSpace(sig.String())
+				if trimmed == "" {
+					contentModified = true
+					continue
+				}
+				// Fernet tokens always start with "gAAAAAB" (version byte 0x80 in
+				// urlsafe-base64). GPT/Codex executors leak these into Claude
+				// `signature` via the codex→claude response translator. Anthropic
+				// rejects them as "Invalid `signature` in `thinking` block".
+				// Strip so the assistant turn survives minus the thinking block.
+				if strings.HasPrefix(trimmed, "gAAAAAB") {
 					contentModified = true
 					continue
 				}

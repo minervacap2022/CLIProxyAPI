@@ -76,6 +76,50 @@ func TestSanitizeMessagesThinking_NoOpOnInvalidInput(t *testing.T) {
 	}
 }
 
+func TestSanitizeMessagesThinking_StripsFernetSignature(t *testing.T) {
+	// Codex/GPT executors emit `encrypted_content` (Fernet format, always
+	// prefixed with "gAAAAAB") which the codex→claude response translator
+	// writes into Claude `signature`. Replaying that to Anthropic triggers
+	// "Invalid `signature` in `thinking` block". Sanitize must drop it.
+	fernetSig := "gAAAAABp6DXjOFQ9Gjihsh7cy8RN4jrgdf_2HFRnc-1-vVtDBSV5b2NE47ZD94PVg1dfRuB2B0eCiMVSp7qozJUFvSkXI1gsIjSvLq5ExJJADPlJZsDSd6oUHatZxfEDJyn4U4r6JGDw"
+	input := []byte(`{"messages":[{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"drop-fernet","signature":"` + fernetSig + `"},` +
+		`{"type":"text","text":"keep-text"}` +
+		`]}]}`)
+
+	out := SanitizeMessagesThinking(input)
+
+	if bytes.Contains(out, []byte("drop-fernet")) {
+		t.Fatalf("expected Fernet-signed thinking block to be removed, got %s", string(out))
+	}
+	if bytes.Contains(out, []byte("gAAAAAB")) {
+		t.Fatalf("expected Fernet signature to be gone, got %s", string(out))
+	}
+	if !bytes.Contains(out, []byte("keep-text")) {
+		t.Fatalf("expected surrounding text block to remain, got %s", string(out))
+	}
+}
+
+func TestSanitizeMessagesThinking_PreservesAnthropicLikeSignature(t *testing.T) {
+	// Legitimate Anthropic thinking signatures are base64 HMAC-style strings
+	// that never begin with "gAAAAAB". They must pass through untouched so
+	// multi-turn extended thinking keeps working.
+	anthropicSig := strings.Repeat("a", 200) // any non-Fernet long string
+	input := []byte(`{"messages":[{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"keep-real","signature":"` + anthropicSig + `"},` +
+		`{"type":"text","text":"ok"}` +
+		`]}]}`)
+
+	out := SanitizeMessagesThinking(input)
+
+	if !bytes.Contains(out, []byte("keep-real")) {
+		t.Fatalf("expected Anthropic thinking block to remain, got %s", string(out))
+	}
+	if !bytes.Contains(out, []byte(anthropicSig)) {
+		t.Fatalf("expected Anthropic signature to remain, got %s", string(out))
+	}
+}
+
 func TestSanitizeMessagesThinking_KimiLikePayloadIsCleaned(t *testing.T) {
 	// Mirrors what Claude Code replays after a Kimi turn: assistant message with a
 	// signature-less thinking block followed by text. Anthropic rejects this with
