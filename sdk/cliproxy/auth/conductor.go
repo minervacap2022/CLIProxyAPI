@@ -3222,10 +3222,24 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
-		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
+		log.WithFields(log.Fields{
+			"provider": auth.Provider,
+			"auth_id":  auth.ID,
+		}).Info("auth refresh canceled")
 		return
 	}
-	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"provider": auth.Provider,
+			"auth_id":  auth.ID,
+			"error":    err.Error(),
+		}).Warn("auth refresh failed")
+	} else {
+		log.WithFields(log.Fields{
+			"provider": auth.Provider,
+			"auth_id":  auth.ID,
+		}).Info("auth refreshed")
+	}
 	now := time.Now()
 	if err != nil {
 		shouldReschedule := false

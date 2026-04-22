@@ -696,7 +696,11 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 		return auth, nil
 	}
 	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	td, err := svc.RefreshTokens(ctx, refreshToken)
+	// Match the Codex executor: retry 3× with exponential backoff. Single-shot
+	// refresh here previously let transient Anthropic OAuth 5xx/network blips
+	// push the auth straight into refreshFailureBackoff, causing overnight
+	// token expiration while auto-refresh kept missing the 4h window.
+	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err
 	}
