@@ -2915,6 +2915,14 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 		return nil
 	}
 	_, err := m.store.Save(ctx, auth)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"auth_id":  auth.ID,
+			"provider": auth.Provider,
+			"file":     auth.FileName,
+			"error":    err.Error(),
+		}).Warn("auth persist failed")
+	}
 	return err
 }
 
@@ -3274,7 +3282,13 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	_, _ = m.Update(ctx, updated)
+	if _, err := m.Update(ctx, updated); err != nil {
+		log.WithFields(log.Fields{
+			"provider": auth.Provider,
+			"auth_id":  auth.ID,
+			"error":    err.Error(),
+		}).Warn("auth refresh update failed")
+	}
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
