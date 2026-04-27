@@ -145,6 +145,10 @@ type Config struct {
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
+	// OAuthRefreshDisabledProviders disables OAuth auto-refresh for the listed
+	// providers on this instance only. It does not mutate shared auth files.
+	OAuthRefreshDisabledProviders []string `yaml:"oauth-refresh-disabled-providers,omitempty" json:"oauth-refresh-disabled-providers,omitempty"`
+
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
