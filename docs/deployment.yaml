@@ -485,10 +485,12 @@ pipeline:
           run: |
             end=$(( $(date +%s) + {{config.primary_stability_window_seconds}} ))
             while [ "$(date +%s)" -lt "$end" ]; do
-              curl -fsS "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.health_path}}" >/dev/null
-              curl -fsS -o /dev/null -w '%{http_code}\n' \
-                "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.management_path}}" \
-                | grep -qx '200'
+              curl -fsS --max-time 5 "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.health_path}}" >/dev/null
+              if [ -n "{{config.management_path}}" ]; then
+                curl -fsS --max-time 5 -o /dev/null -w '%{http_code}\n' \
+                  "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.management_path}}" \
+                  | grep -qx '200'
+              fi
               docker logs --tail 100 "{{targets.primary.container}}" 2>&1 \
                 | grep -iE 'error|panic|fatal' && exit 1 || true
               sleep {{config.primary_stability_check_interval_seconds}}
