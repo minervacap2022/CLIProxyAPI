@@ -20,6 +20,10 @@ type PayloadRule = internalconfig.PayloadRule
 type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
 
+type APIKeyConfig = internalconfig.APIKeyConfig
+type ModelGroup = internalconfig.ModelGroup
+type ModelGroupEntry = internalconfig.ModelGroupEntry
+
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type ClaudeKey = internalconfig.ClaudeKey

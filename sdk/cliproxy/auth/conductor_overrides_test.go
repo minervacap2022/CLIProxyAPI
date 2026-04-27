@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -61,6 +62,49 @@ func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testi
 	_, shouldRetry = m.shouldRetryAfterError(&Error{HTTPStatus: 500, Message: "boom"}, 1, []string{"claude"}, model, maxWait)
 	if shouldRetry {
 		t.Fatalf("expected shouldRetry=false on attempt=1 for request_retry=1, got true")
+	}
+}
+
+func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(3, 30*time.Second, 0)
+	m.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"kimi": {
+			{Name: "deepseek-v3.1", Alias: "pool-model"},
+		},
+	})
+
+	routeModel := "pool-model"
+	upstreamModel := "deepseek-v3.1"
+	next := time.Now().Add(5 * time.Second)
+
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "kimi",
+		ModelStates: map[string]*ModelState{
+			upstreamModel: {
+				Unavailable:    true,
+				Status:         StatusError,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+				},
+			},
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	_, _, maxWait := m.retrySettings()
+	wait, shouldRetry := m.shouldRetryAfterError(&Error{HTTPStatus: 429, Message: "quota"}, 0, []string{"kimi"}, routeModel, maxWait)
+	if !shouldRetry {
+		t.Fatalf("expected shouldRetry=true, got false (wait=%v)", wait)
+	}
+	if wait <= 0 {
+		t.Fatalf("expected wait > 0, got %v", wait)
 	}
 }
 
@@ -178,6 +222,34 @@ func (e *authFallbackExecutor) StreamCalls() []string {
 	out := make([]string, len(e.streamCalls))
 	copy(out, e.streamCalls)
 	return out
+}
+
+type retryAfterStatusError struct {
+	status     int
+	message    string
+	retryAfter time.Duration
+}
+
+func (e *retryAfterStatusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func (e *retryAfterStatusError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.status
+}
+
+func (e *retryAfterStatusError) RetryAfter() *time.Duration {
+	if e == nil {
+		return nil
+	}
+	d := e.retryAfter
+	return &d
 }
 
 func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (*Manager, *credentialRetryLimitExecutor) {
@@ -450,6 +522,225 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	}
 }
 
+func TestManager_MarkResult_RespectsAuthDisableCoolingOverride_On403(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-403",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"disable_cooling": true,
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-403"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "claude",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusForbidden, Message: "forbidden"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
+	}
+
+	if count := reg.GetModelCount(model); count <= 0 {
+		t.Fatalf("expected model count > 0 when disable_cooling=true, got %d", count)
+	}
+}
+
+func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter403(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"auth-403-exec": &Error{
+				HTTPStatus: http.StatusForbidden,
+				Message:    "forbidden",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{
+		ID:       "auth-403-exec",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"disable_cooling": true,
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-403-exec"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	req := cliproxyexecutor.Request{Model: model}
+	_, errExecute1 := m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
+	if errExecute1 == nil {
+		t.Fatal("expected first execute error")
+	}
+	if statusCodeFromError(errExecute1) != http.StatusForbidden {
+		t.Fatalf("first execute status = %d, want %d", statusCodeFromError(errExecute1), http.StatusForbidden)
+	}
+
+	_, errExecute2 := m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
+	if errExecute2 == nil {
+		t.Fatal("expected second execute error")
+	}
+	if statusCodeFromError(errExecute2) != http.StatusForbidden {
+		t.Fatalf("second execute status = %d, want %d", statusCodeFromError(errExecute2), http.StatusForbidden)
+	}
+}
+
+func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter429RetryAfter(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"auth-429-exec": &retryAfterStatusError{
+				status:     http.StatusTooManyRequests,
+				message:    "quota exhausted",
+				retryAfter: 2 * time.Minute,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{
+		ID:       "auth-429-exec",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"disable_cooling": true,
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-429-exec"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	req := cliproxyexecutor.Request{Model: model}
+	_, errExecute1 := m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
+	if errExecute1 == nil {
+		t.Fatal("expected first execute error")
+	}
+	if statusCodeFromError(errExecute1) != http.StatusTooManyRequests {
+		t.Fatalf("first execute status = %d, want %d", statusCodeFromError(errExecute1), http.StatusTooManyRequests)
+	}
+
+	_, errExecute2 := m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
+	if errExecute2 == nil {
+		t.Fatal("expected second execute error")
+	}
+	if statusCodeFromError(errExecute2) != http.StatusTooManyRequests {
+		t.Fatalf("second execute status = %d, want %d", statusCodeFromError(errExecute2), http.StatusTooManyRequests)
+	}
+
+	calls := executor.ExecuteCalls()
+	if len(calls) != 2 {
+		t.Fatalf("execute calls = %d, want 2", len(calls))
+	}
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
+	}
+}
+
+func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(3, 100*time.Millisecond, 0)
+
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"auth-429-retryafter-exec": &retryAfterStatusError{
+				status:     http.StatusTooManyRequests,
+				message:    "quota exhausted",
+				retryAfter: 5 * time.Millisecond,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{
+		ID:       "auth-429-retryafter-exec",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"disable_cooling": true,
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-429-retryafter-exec"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	req := cliproxyexecutor.Request{Model: model}
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected execute error")
+	}
+	if statusCodeFromError(errExecute) != http.StatusTooManyRequests {
+		t.Fatalf("execute status = %d, want %d", statusCodeFromError(errExecute), http.StatusTooManyRequests)
+	}
+
+	calls := executor.ExecuteCalls()
+	if len(calls) != 4 {
+		t.Fatalf("execute calls = %d, want 4 (initial + 3 retries)", len(calls))
+	}
+}
+
 func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 
@@ -558,5 +849,106 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 	}
 	if state := updatedBad.ModelStates[model]; state != nil {
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
+	}
+}
+
+// TestManager_MarkResult_429WithRetryAfter_LocksAllModels verifies that when a 429
+// result carries a RetryAfter duration (i.e. Anthropic's exact quota-reset timestamp),
+// every ModelState on that auth — not just the failing model — is locked until the
+// reset time.  This reflects the fact that Anthropic quota is account-scoped.
+func TestManager_MarkResult_429WithRetryAfter_LocksAllModels(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-quota",
+		Provider: "claude",
+		ModelStates: map[string]*ModelState{
+			"claude-opus-4-5":    {Status: StatusActive},
+			"claude-sonnet-4-6":  {Status: StatusActive},
+			"claude-haiku-4-5":   {Status: StatusActive},
+		},
+	}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	retryAfter := 5 * time.Hour
+	m.MarkResult(context.Background(), Result{
+		AuthID:     auth.ID,
+		Provider:   auth.Provider,
+		Model:      "claude-opus-4-5",
+		Success:    false,
+		Error:      &Error{HTTPStatus: 429, Message: "quota exceeded"},
+		RetryAfter: &retryAfter,
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("auth not found after MarkResult")
+	}
+
+	// Auth-level cooldown must be set.
+	if updated.NextRetryAfter.IsZero() {
+		t.Fatalf("auth.NextRetryAfter should be set for account-level quota exhaustion")
+	}
+
+	// Every model state must be locked, not just the one that triggered the 429.
+	for model, state := range updated.ModelStates {
+		if state == nil {
+			t.Fatalf("ModelState for %q is nil", model)
+		}
+		if !state.Unavailable {
+			t.Errorf("model %q: expected Unavailable=true, got false", model)
+		}
+		if state.NextRetryAfter.IsZero() {
+			t.Errorf("model %q: expected NextRetryAfter to be set, got zero", model)
+		}
+		if !state.Quota.Exceeded {
+			t.Errorf("model %q: expected Quota.Exceeded=true", model)
+		}
+	}
+}
+
+// TestManager_MarkResult_429WithoutRetryAfter_LocksOnlyTriggeredModel verifies that a
+// plain 429 (no RetryAfter, e.g. a transient rate-limit) only locks the model that
+// returned the error and leaves other models untouched.
+func TestManager_MarkResult_429WithoutRetryAfter_LocksOnlyTriggeredModel(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-ratelimit",
+		Provider: "claude",
+		ModelStates: map[string]*ModelState{
+			"claude-opus-4-5":   {Status: StatusActive},
+			"claude-sonnet-4-6": {Status: StatusActive},
+		},
+	}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "claude-opus-4-5",
+		Success:  false,
+		Error:    &Error{HTTPStatus: 429, Message: "rate limit"},
+		// RetryAfter intentionally nil — no Anthropic reset header.
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("auth not found after MarkResult")
+	}
+
+	opusState := updated.ModelStates["claude-opus-4-5"]
+	if opusState == nil || !opusState.Unavailable {
+		t.Errorf("opus: expected Unavailable=true")
+	}
+
+	// sonnet must NOT be locked.
+	sonnetState := updated.ModelStates["claude-sonnet-4-6"]
+	if sonnetState != nil && sonnetState.Unavailable {
+		t.Errorf("sonnet: expected Unavailable=false for plain rate-limit 429, got true")
 	}
 }

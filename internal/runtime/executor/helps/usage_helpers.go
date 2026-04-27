@@ -69,9 +69,6 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 			detail.TotalTokens = total
 		}
 	}
-	if detail.InputTokens == 0 && detail.OutputTokens == 0 && detail.ReasoningTokens == 0 && detail.CachedTokens == 0 && detail.TotalTokens == 0 && !failed {
-		return
-	}
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
 	})
@@ -244,7 +241,11 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	usageNode := gjson.GetBytes(payload, "usage")
-	if !usageNode.Exists() {
+	// Some providers (e.g. Doubao) emit "usage":null on intermediate stream
+	// chunks. gjson's Exists() returns true for null, so we must reject it
+	// explicitly — otherwise the reporter's sync.Once fires with zero tokens
+	// before the real usage chunk arrives.
+	if !usageNode.Exists() || usageNode.Type == gjson.Null {
 		return usage.Detail{}, false
 	}
 	detail := usage.Detail{
@@ -285,7 +286,11 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	usageNode := gjson.GetBytes(payload, "usage")
-	if !usageNode.Exists() {
+	// Some providers (e.g. Doubao) emit "usage":null on intermediate stream
+	// chunks. gjson's Exists() returns true for null, so we must reject it
+	// explicitly — otherwise the reporter's sync.Once fires with zero tokens
+	// before the real usage chunk arrives.
+	if !usageNode.Exists() || usageNode.Type == gjson.Null {
 		return usage.Detail{}, false
 	}
 	detail := usage.Detail{

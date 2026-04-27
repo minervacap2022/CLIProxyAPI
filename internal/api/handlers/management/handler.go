@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -48,6 +49,31 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	/*
+	 * keyConfigRefreshFunc is called whenever api-key-configs or model-groups change
+	 * so the server can immediately rebuild its in-memory lookup indexes.
+	 * It is optional; when nil the change takes effect after the next file-watcher reload.
+	 */
+	keyConfigRefreshFunc func()
+
+	// warmupController is an optional hook to restart / trigger the warmup
+	// scheduler when the warmup config is mutated via the management API.
+	warmupController WarmupController
+}
+
+// WarmupController abstracts the warmup scheduler so management handlers can
+// trigger rounds or ask the service to reload the scheduler after config
+// updates without introducing a hard dependency on internal/warmup.
+type WarmupController interface {
+	// TriggerNow runs a single warmup round synchronously.
+	TriggerNow(ctx context.Context, reason string)
+	// Reload applies the current config.Warmup settings — stops the previous
+	// scheduler and starts a new one using the cfg.Warmup values. Errors are
+	// returned for invalid configs so the management API can surface them.
+	Reload() error
+	// SupportedProviders returns the provider keys that have a warmup recipe
+	// registered, for surfacing in the management UI.
+	SupportedProviders() []string
 }
 
 // NewHandler creates a new management handler instance.
@@ -105,10 +131,24 @@ func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manag
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.
-func (h *Handler) SetConfig(cfg *config.Config) { h.cfg = cfg }
+func (h *Handler) SetConfig(cfg *config.Config) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.cfg = cfg
+	h.mu.Unlock()
+}
 
 // SetAuthManager updates the auth manager reference used by management endpoints.
-func (h *Handler) SetAuthManager(manager *coreauth.Manager) { h.authManager = manager }
+func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.authManager = manager
+	h.mu.Unlock()
+}
 
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
@@ -132,6 +172,22 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetKeyConfigRefreshFunc registers an optional callback invoked after api-key-configs or
+// model-groups are modified via the management API, allowing the server to immediately
+// rebuild its in-memory lookup indexes.
+func (h *Handler) SetKeyConfigRefreshFunc(f func()) {
+	h.keyConfigRefreshFunc = f
+}
+
+// SetWarmupController wires the warmup scheduler into the management handler
+// so operators can trigger rounds and reload the scheduler after config edits.
+// Passing nil clears the controller (warmup endpoints will return 503).
+func (h *Handler) SetWarmupController(ctrl WarmupController) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.warmupController = ctrl
 }
 
 // Middleware enforces access control for management endpoints.
@@ -276,6 +332,12 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 func (h *Handler) persist(c *gin.Context) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.persistLocked(c)
+}
+
+// persistLocked saves the current in-memory config to disk.
+// It expects the caller to hold h.mu.
+func (h *Handler) persistLocked(c *gin.Context) bool {
 	// Preserve comments when writing
 	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})

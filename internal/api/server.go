@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
@@ -171,6 +172,15 @@ type Server struct {
 
 	localPassword string
 
+	// apiKeyConfigIndex is an atomically swapped lookup map from API key string to
+	// *config.APIKeyConfig. It is rebuilt on startup and on every config hot-reload.
+	// Using atomic.Value lets the auth middleware read it lock-free on the hot path.
+	apiKeyConfigIndex atomic.Value // stores map[string]*config.APIKeyConfig
+
+	// modelGroupIndex is an atomically swapped lookup map from group name to
+	// *config.ModelGroup. Rebuilt alongside apiKeyConfigIndex.
+	modelGroupIndex atomic.Value // stores map[string]*config.ModelGroup
+
 	keepAliveEnabled   bool
 	keepAliveTimeout   time.Duration
 	keepAliveOnTimeout func()
@@ -256,13 +266,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 	s.applyAccessConfig(nil, cfg)
+	s.rebuildKeyConfigIndexes(cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetKeyConfigRefreshFunc(func() { s.rebuildKeyConfigIndexes(s.cfg) })
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -317,6 +330,17 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
+	healthzHandler := func(c *gin.Context) {
+		if c.Request.Method == http.MethodHead {
+			c.Status(http.StatusOK)
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	}
+	s.engine.GET("/healthz", healthzHandler)
+	s.engine.HEAD("/healthz", healthzHandler)
+
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
@@ -327,10 +351,13 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(s.keyConfigMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
+		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
+		v1.POST("/images/edits", openaiHandlers.ImagesEdits)
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
@@ -341,6 +368,7 @@ func (s *Server) setupRoutes() {
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(s.keyConfigMiddleware())
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -405,20 +433,6 @@ func (s *Server) setupRoutes() {
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
 
-	s.engine.GET("/iflow/callback", func(c *gin.Context) {
-		code := c.Query("code")
-		state := c.Query("state")
-		errStr := c.Query("error")
-		if errStr == "" {
-			errStr = c.Query("error_description")
-		}
-		if state != "" {
-			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "iflow", state, code, errStr)
-		}
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusOK, oauthCallbackSuccessHTML)
-	})
-
 	s.engine.GET("/antigravity/callback", func(c *gin.Context) {
 		code := c.Query("code")
 		state := c.Query("state")
@@ -434,6 +448,16 @@ func (s *Server) setupRoutes() {
 	})
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
+}
+
+// ManagementHandler exposes the management handler so external code (e.g. the
+// cliproxy service) can wire auxiliary controllers such as the warmup scheduler.
+// Returns nil when the server was initialised without management.
+func (s *Server) ManagementHandler() *managementHandlers.Handler {
+	if s == nil {
+		return nil
+	}
+	return s.mgmt
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
@@ -521,6 +545,11 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
 
+		mgmt.GET("/warmup", s.mgmt.GetWarmup)
+		mgmt.PUT("/warmup", s.mgmt.PutWarmup)
+		mgmt.PATCH("/warmup", s.mgmt.PutWarmup)
+		mgmt.POST("/warmup/trigger", s.mgmt.TriggerWarmup)
+
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
 		mgmt.PATCH("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
@@ -533,6 +562,16 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
+
+		mgmt.GET("/api-key-configs", s.mgmt.GetAPIKeyConfigs)
+		mgmt.PUT("/api-key-configs", s.mgmt.PutAPIKeyConfigs)
+		mgmt.PATCH("/api-key-configs", s.mgmt.PatchAPIKeyConfig)
+		mgmt.DELETE("/api-key-configs", s.mgmt.DeleteAPIKeyConfig)
+
+		mgmt.GET("/model-groups", s.mgmt.GetModelGroups)
+		mgmt.PUT("/model-groups", s.mgmt.PutModelGroups)
+		mgmt.PATCH("/model-groups", s.mgmt.PatchModelGroup)
+		mgmt.DELETE("/model-groups", s.mgmt.DeleteModelGroup)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
@@ -634,10 +673,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
-		mgmt.GET("/qwen-auth-url", s.mgmt.RequestQwenToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
-		mgmt.GET("/iflow-auth-url", s.mgmt.RequestIFlowToken)
-		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
@@ -859,6 +895,17 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
+// rebuildKeyConfigIndexes rebuilds the apiKeyConfigIndex and modelGroupIndex from cfg.
+// It is called on startup and on every config hot-reload so that the middleware always
+// uses up-to-date per-key policy without holding a lock during request handling.
+func (s *Server) rebuildKeyConfigIndexes(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	s.apiKeyConfigIndex.Store(cfg.BuildAPIKeyConfigIndex())
+	s.modelGroupIndex.Store(cfg.BuildModelGroupIndex())
+}
+
 func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
 	if s == nil || s.accessManager == nil || newCfg == nil {
 		return
@@ -914,6 +961,8 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	}
 
+	applySignatureCacheConfig(oldCfg, cfg)
+
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
@@ -956,6 +1005,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	s.applyAccessConfig(oldCfg, cfg)
+	s.rebuildKeyConfigIndexes(cfg)
 	s.cfg = cfg
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
@@ -1022,6 +1072,47 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 
 // (management handlers moved to internal/api/handlers/management)
 
+// keyConfigMiddleware returns a Gin middleware that injects the *config.APIKeyConfig
+// and *config.ModelGroup (when the key is assigned a group) into the Gin context
+// after authentication. It reads atomically swapped lookup maps so it is lock-free
+// on the hot path.
+//
+// Context keys set by this middleware:
+//   - "apiKeyConfig"  → *config.APIKeyConfig (nil when key has no extended config)
+//   - "modelGroup"    → *config.ModelGroup   (nil when key has no model group)
+func (s *Server) keyConfigMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		apiKeyRaw, exists := c.Get("apiKey")
+		if !exists {
+			c.Next()
+			return
+		}
+		apiKey, _ := apiKeyRaw.(string)
+		if apiKey == "" {
+			c.Next()
+			return
+		}
+
+		if raw := s.apiKeyConfigIndex.Load(); raw != nil {
+			if idx, ok := raw.(map[string]*config.APIKeyConfig); ok {
+				if kc, found := idx[apiKey]; found {
+					c.Set("apiKeyConfig", kc)
+					if kc.ModelGroup != "" {
+						if groupRaw := s.modelGroupIndex.Load(); groupRaw != nil {
+							if gidx, ok2 := groupRaw.(map[string]*config.ModelGroup); ok2 {
+								if mg, found2 := gidx[kc.ModelGroup]; found2 {
+									c.Set("modelGroup", mg)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		c.Next()
+	}
+}
+
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
 // using the configured authentication providers. When no providers are available,
 // it allows all requests (legacy behaviour).
@@ -1051,4 +1142,38 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}
+}
+
+func configuredSignatureCacheEnabled(cfg *config.Config) bool {
+	if cfg != nil && cfg.AntigravitySignatureCacheEnabled != nil {
+		return *cfg.AntigravitySignatureCacheEnabled
+	}
+	return true
+}
+
+func applySignatureCacheConfig(oldCfg, cfg *config.Config) {
+	newVal := configuredSignatureCacheEnabled(cfg)
+	newStrict := configuredSignatureBypassStrict(cfg)
+	if oldCfg == nil {
+		cache.SetSignatureCacheEnabled(newVal)
+		cache.SetSignatureBypassStrictMode(newStrict)
+		return
+	}
+
+	oldVal := configuredSignatureCacheEnabled(oldCfg)
+	if oldVal != newVal {
+		cache.SetSignatureCacheEnabled(newVal)
+	}
+
+	oldStrict := configuredSignatureBypassStrict(oldCfg)
+	if oldStrict != newStrict {
+		cache.SetSignatureBypassStrictMode(newStrict)
+	}
+}
+
+func configuredSignatureBypassStrict(cfg *config.Config) bool {
+	if cfg != nil && cfg.AntigravitySignatureBypassStrict != nil {
+		return *cfg.AntigravitySignatureBypassStrict
+	}
+	return false
 }

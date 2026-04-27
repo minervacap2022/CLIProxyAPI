@@ -68,6 +68,10 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
+	// When <= 0, the default worker count is used.
+	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
+
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
@@ -84,6 +88,13 @@ type Config struct {
 
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
+
+	// AntigravitySignatureCacheEnabled controls whether signature cache validation is enabled for thinking blocks.
+	// When true (default), cached signatures are preferred and validated.
+	// When false, client signatures are used directly after normalization (bypass mode).
+	AntigravitySignatureCacheEnabled *bool `yaml:"antigravity-signature-cache-enabled,omitempty" json:"antigravity-signature-cache-enabled,omitempty"`
+
+	AntigravitySignatureBypassStrict *bool `yaml:"antigravity-signature-bypass-strict,omitempty" json:"antigravity-signature-bypass-strict,omitempty"`
 
 	// GeminiKey defines Gemini API key configurations with optional routing overrides.
 	GeminiKey []GeminiKey `yaml:"gemini-api-key" json:"gemini-api-key"`
@@ -112,21 +123,83 @@ type Config struct {
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
+	// APIKeyConfigs defines per-API-key model restrictions and routing overrides.
+	// Keys listed here are automatically merged into the flat api-keys list so that
+	// MakeInlineAPIKeyProvider picks them up without requiring duplicate entries.
+	APIKeyConfigs []APIKeyConfig `yaml:"api-key-configs,omitempty" json:"api-key-configs,omitempty"`
+
+	// ModelGroups defines named groups of models with priority tiers.
+	// Clients may request a group name as the model identifier; the proxy resolves
+	// it to the highest-priority available model, falling back to lower tiers on quota
+	// exhaustion (see model group failover in the handler layer).
+	ModelGroups []ModelGroup `yaml:"model-groups,omitempty" json:"model-groups,omitempty"`
+
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
-	// gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow.
+	// gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
+	// OAuthRefreshDisabledProviders disables OAuth auto-refresh for the listed
+	// providers on this instance only. It does not mutate shared auth files.
+	OAuthRefreshDisabledProviders []string `yaml:"oauth-refresh-disabled-providers,omitempty" json:"oauth-refresh-disabled-providers,omitempty"`
+
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// Warmup configures proactive session-window warmup for OAuth auths.
+	// Useful for providers like Claude Max (5-hour session window) where the
+	// first request starts the billing/quota window; firing a minimal warmup
+	// request early lets operators align the session window with working hours
+	// or refresh it periodically.
+	Warmup WarmupConfig `yaml:"warmup,omitempty" json:"warmup,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// WarmupConfig controls the OAuth warmup scheduler.
+//
+// Warmup fires a minimal API request against each eligible OAuth auth to open
+// the provider session window before real traffic arrives. It is a no-op when
+// Enabled is false. Warmup never runs against API-key (not-OAuth) auths.
+type WarmupConfig struct {
+	// Enabled toggles the warmup scheduler.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Interval fires a warmup for each eligible auth every N duration
+	// (e.g. "4h30m"). Empty or <=0 disables interval-based warmup.
+	// Polling / 轮询预热 setting.
+	Interval string `yaml:"interval,omitempty" json:"interval,omitempty"`
+	// StartAt fires a daily warmup at the specified time-of-day "HH:MM"
+	// (24h clock). Empty disables daily warmup. Useful to start the Claude
+	// 5-hour session window aligned with work hours.
+	// Scheduled / 定时预热 setting.
+	StartAt string `yaml:"start-at,omitempty" json:"start-at,omitempty"`
+	// Timezone names the IANA zone that StartAt is interpreted in. When empty,
+	// defaults to "Asia/Shanghai" (UTC+8). The server converts the resulting
+	// instant to system local time at runtime — so you always write the wall
+	// clock time you care about (e.g. "08:50") and the server does the math.
+	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
+	// OnStartup fires a single warmup round when the service starts.
+	OnStartup bool `yaml:"on-startup,omitempty" json:"on-startup,omitempty"`
+	// Providers optionally restricts warmup to the listed provider keys
+	// (e.g. ["claude", "codex"]). Empty list means all supported providers.
+	Providers []string `yaml:"providers,omitempty" json:"providers,omitempty"`
+	// Models overrides the default warmup model per provider (keyed by
+	// lower-case provider name). When unset, built-in recipe defaults are used.
+	// Example:
+	//   models:
+	//     claude: claude-haiku-4-5
+	//     gemini: gemini-2.5-flash-lite
+	Models map[string]string `yaml:"models,omitempty" json:"models,omitempty"`
+	// Concurrency caps concurrent warmup calls; defaults to 2 when <=0.
+	Concurrency int `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
+	// Timeout limits each warmup request (e.g. "30s"); defaults to 30s when empty.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
@@ -205,6 +278,79 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.
+	// When enabled, requests with the same session ID (extracted from metadata.user_id)
+	// are routed to the same auth credential when available.
+	// Deprecated: Use SessionAffinity instead for universal session support.
+	ClaudeCodeSessionAffinity bool `yaml:"claude-code-session-affinity,omitempty" json:"claude-code-session-affinity,omitempty"`
+
+	// SessionAffinity enables universal session-sticky routing for all clients.
+	// Session IDs are extracted from multiple sources:
+	// X-Session-ID header, Idempotency-Key, metadata.user_id, conversation_id, or message hash.
+	// Automatic failover is always enabled when bound auth becomes unavailable.
+	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
+
+	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
+	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
+	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+}
+
+// APIKeyConfig extends a client API key with optional per-key model restrictions
+// and load balancing overrides. Keys defined here are merged into the flat api-keys
+// list at load time so that MakeInlineAPIKeyProvider picks them up unchanged.
+type APIKeyConfig struct {
+	// Key is the client API key string, identical to an entry in the flat api-keys list.
+	Key string `yaml:"key" json:"key"`
+
+	// Label is an optional human-readable name shown in the management UI.
+	Label string `yaml:"label,omitempty" json:"label,omitempty"`
+
+	// AllowedModels restricts this key to specific model IDs. Requests for other
+	// models are rejected with 403. Empty slice means no restriction.
+	AllowedModels []string `yaml:"allowed-models,omitempty" json:"allowed-models,omitempty"`
+
+	// ModelGroup references a named ModelGroup by name. Clients may send the group
+	// name as the model identifier; the proxy resolves the highest-priority available
+	// model within the group, with automatic failover to lower priority tiers.
+	ModelGroup string `yaml:"model-group,omitempty" json:"model-group,omitempty"`
+
+	// AllowOtherModels, when true, allows this key to request any model directly
+	// in addition to the configured ModelGroup. When false (default), only the
+	// group name is accepted as a model identifier.
+	AllowOtherModels bool `yaml:"allow-other-models,omitempty" json:"allow-other-models,omitempty"`
+
+	// Routing overrides the global routing strategy for requests authenticated with
+	// this key. Nil inherits the global routing config.
+	Routing *RoutingConfig `yaml:"routing,omitempty" json:"routing,omitempty"`
+
+	// Priority overrides the credential priority filter for requests authenticated
+	// with this key. When set, only credentials at or above this priority level are
+	// considered during selection. Nil means no restriction (all priorities allowed).
+	Priority *int `yaml:"priority,omitempty" json:"priority,omitempty"`
+}
+
+// ModelGroupEntry represents a single model within a ModelGroup with an associated priority.
+type ModelGroupEntry struct {
+	// Model is the model identifier (e.g. "claude-sonnet-4-20250514").
+	Model string `yaml:"model" json:"model"`
+
+	// Priority defines the failover tier. Higher values are preferred.
+	// Models sharing the same priority are load-balanced among each other.
+	// When all models at a tier exhaust quota, the next lower tier is tried.
+	Priority int `yaml:"priority" json:"priority"`
+}
+
+// ModelGroup is a named collection of models with priority-based failover.
+// Clients use the group Name as a virtual model identifier. The proxy resolves
+// it to the highest-priority available model in the group, falling back through
+// lower tiers when quota is exhausted.
+type ModelGroup struct {
+	// Name is the unique identifier for this group, used as the virtual model name.
+	Name string `yaml:"name" json:"name"`
+
+	// Models lists the group members with their priority tiers.
+	Models []ModelGroupEntry `yaml:"models" json:"models"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -668,6 +814,16 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
+	// Sanitize and deduplicate per-API-key config entries.
+	cfg.SanitizeAPIKeyConfigs()
+
+	// Sanitize and deduplicate model group definitions.
+	cfg.SanitizeModelGroups()
+
+	// Merge keys from APIKeyConfigs into the flat api-keys list so that
+	// MakeInlineAPIKeyProvider authenticates them without duplicate entries.
+	cfg.MergeAPIKeyConfigsIntoFlatList()
+
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
@@ -769,6 +925,148 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
 }
 
+// SanitizeAPIKeyConfigs trims whitespace from all string fields in APIKeyConfigs,
+// drops entries with blank keys, and removes blank entries from AllowedModels slices.
+func (cfg *Config) SanitizeAPIKeyConfigs() {
+	if cfg == nil || len(cfg.APIKeyConfigs) == 0 {
+		return
+	}
+	out := make([]APIKeyConfig, 0, len(cfg.APIKeyConfigs))
+	for _, kc := range cfg.APIKeyConfigs {
+		kc.Key = strings.TrimSpace(kc.Key)
+		if kc.Key == "" {
+			continue
+		}
+		kc.Label = strings.TrimSpace(kc.Label)
+		kc.ModelGroup = strings.TrimSpace(kc.ModelGroup)
+		if len(kc.AllowedModels) > 0 {
+			trimmed := make([]string, 0, len(kc.AllowedModels))
+			for _, m := range kc.AllowedModels {
+				m = strings.TrimSpace(m)
+				if m != "" {
+					trimmed = append(trimmed, m)
+				}
+			}
+			kc.AllowedModels = trimmed
+		}
+		out = append(out, kc)
+	}
+	cfg.APIKeyConfigs = out
+}
+
+// SanitizeModelGroups trims whitespace from all string fields in ModelGroups,
+// drops groups with blank names, and removes model entries with blank model names.
+// Groups that have no valid model entries after sanitization are also dropped.
+func (cfg *Config) SanitizeModelGroups() {
+	if cfg == nil || len(cfg.ModelGroups) == 0 {
+		return
+	}
+	out := make([]ModelGroup, 0, len(cfg.ModelGroups))
+	for _, g := range cfg.ModelGroups {
+		g.Name = strings.TrimSpace(g.Name)
+		if g.Name == "" {
+			continue
+		}
+		if len(g.Models) > 0 {
+			validModels := make([]ModelGroupEntry, 0, len(g.Models))
+			for _, me := range g.Models {
+				me.Model = strings.TrimSpace(me.Model)
+				if me.Model != "" {
+					validModels = append(validModels, me)
+				}
+			}
+			g.Models = validModels
+		}
+		if len(g.Models) == 0 {
+			continue
+		}
+		out = append(out, g)
+	}
+	cfg.ModelGroups = out
+}
+
+// MergeAPIKeyConfigsIntoFlatList ensures all keys from APIKeyConfigs also appear
+// in the flat SDKConfig.APIKeys slice. This allows MakeInlineAPIKeyProvider to
+// authenticate those keys without requiring duplicate entries in the config file.
+// Blank keys are skipped; existing keys are not duplicated.
+func (cfg *Config) MergeAPIKeyConfigsIntoFlatList() {
+	if cfg == nil || len(cfg.APIKeyConfigs) == 0 {
+		return
+	}
+	existing := make(map[string]struct{}, len(cfg.APIKeys))
+	for _, k := range cfg.APIKeys {
+		existing[k] = struct{}{}
+	}
+	for _, kc := range cfg.APIKeyConfigs {
+		key := strings.TrimSpace(kc.Key)
+		if key == "" {
+			continue
+		}
+		if _, dup := existing[key]; dup {
+			continue
+		}
+		cfg.APIKeys = append(cfg.APIKeys, key)
+		existing[key] = struct{}{}
+	}
+}
+
+// LookupAPIKeyConfig returns the APIKeyConfig for the given key string, or nil
+// if no config entry exists for that key. Linear scan; prefer BuildAPIKeyConfigIndex
+// when performing repeated lookups in a hot path.
+func (cfg *Config) LookupAPIKeyConfig(key string) *APIKeyConfig {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.APIKeyConfigs {
+		if cfg.APIKeyConfigs[i].Key == key {
+			return &cfg.APIKeyConfigs[i]
+		}
+	}
+	return nil
+}
+
+// LookupModelGroup returns the ModelGroup with the given name, or nil if not found.
+// Linear scan; prefer BuildModelGroupIndex for repeated lookups.
+func (cfg *Config) LookupModelGroup(name string) *ModelGroup {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.ModelGroups {
+		if cfg.ModelGroups[i].Name == name {
+			return &cfg.ModelGroups[i]
+		}
+	}
+	return nil
+}
+
+// BuildAPIKeyConfigIndex builds a map from API key string to *APIKeyConfig for O(1)
+// lookups. The returned map holds pointers into the Config's APIKeyConfigs slice;
+// callers must not modify the slice concurrently while using this map.
+func (cfg *Config) BuildAPIKeyConfigIndex() map[string]*APIKeyConfig {
+	if cfg == nil || len(cfg.APIKeyConfigs) == 0 {
+		return make(map[string]*APIKeyConfig)
+	}
+	m := make(map[string]*APIKeyConfig, len(cfg.APIKeyConfigs))
+	for i := range cfg.APIKeyConfigs {
+		m[cfg.APIKeyConfigs[i].Key] = &cfg.APIKeyConfigs[i]
+	}
+	return m
+}
+
+// BuildModelGroupIndex builds a map from group name to *ModelGroup for O(1) lookups.
+// The returned map holds pointers into the Config's ModelGroups slice; callers must
+// not modify the slice concurrently while using this map.
+func (cfg *Config) BuildModelGroupIndex() map[string]*ModelGroup {
+	if cfg == nil || len(cfg.ModelGroups) == 0 {
+		return make(map[string]*ModelGroup)
+	}
+	m := make(map[string]*ModelGroup, len(cfg.ModelGroups))
+	for i := range cfg.ModelGroups {
+		m[cfg.ModelGroups[i].Name] = &cfg.ModelGroups[i]
+	}
+	return m
+}
+
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
 // It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
 // allows multiple aliases per upstream name, and ensures aliases are unique within each channel.
@@ -865,6 +1163,7 @@ func (cfg *Config) SanitizeClaudeKeys() {
 }
 
 // SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
+// It uses API key + base URL as the uniqueness key.
 func (cfg *Config) SanitizeGeminiKeys() {
 	if cfg == nil {
 		return
@@ -883,10 +1182,11 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
-		if _, exists := seen[entry.APIKey]; exists {
+		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		if _, exists := seen[uniqueKey]; exists {
 			continue
 		}
-		seen[entry.APIKey] = struct{}{}
+		seen[uniqueKey] = struct{}{}
 		out = append(out, entry)
 	}
 	cfg.GeminiKey = out

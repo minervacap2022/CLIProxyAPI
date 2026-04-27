@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/warmup"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -89,6 +90,82 @@ type Service struct {
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
+
+	// warmupScheduler fires proactive warmup requests against OAuth auths to
+	// open provider session windows before real traffic arrives.
+	warmupScheduler *warmup.Scheduler
+
+	// warmupCtx is the parent context handed to the warmup scheduler.
+	// It survives across Reload calls so reloaded schedulers share lifetime.
+	warmupCtx context.Context
+
+	// warmupMu guards warmupScheduler replacements during Reload.
+	warmupMu sync.Mutex
+}
+
+// warmupAdapter bridges the management-handler WarmupController interface and
+// the concrete scheduler, so internal/api/handlers/management does not depend
+// on internal/warmup.
+type warmupAdapter struct {
+	svc *Service
+}
+
+func (a *warmupAdapter) TriggerNow(ctx context.Context, reason string) {
+	if a == nil || a.svc == nil {
+		return
+	}
+	a.svc.warmupMu.Lock()
+	sched := a.svc.warmupScheduler
+	a.svc.warmupMu.Unlock()
+	if sched == nil {
+		return
+	}
+	sched.TriggerNow(ctx, reason)
+}
+
+func (a *warmupAdapter) SupportedProviders() []string {
+	return warmup.SupportedProviders()
+}
+
+// Reload parses the current cfg.Warmup, stops the previous scheduler and
+// launches a new one with the updated settings. Safe to call concurrently.
+func (a *warmupAdapter) Reload() error {
+	if a == nil || a.svc == nil {
+		return errors.New("cliproxy: service unavailable")
+	}
+	svc := a.svc
+	svc.cfgMu.RLock()
+	cfg := svc.cfg
+	svc.cfgMu.RUnlock()
+	if cfg == nil {
+		return errors.New("cliproxy: config unavailable")
+	}
+	wopts, err := warmup.ParseOptions(cfg.Warmup)
+	if err != nil {
+		return err
+	}
+
+	svc.warmupMu.Lock()
+	prev := svc.warmupScheduler
+	svc.warmupScheduler = nil
+	svc.warmupMu.Unlock()
+	if prev != nil {
+		prev.Stop()
+	}
+	if wopts == nil {
+		// Warmup disabled — nothing more to do.
+		return nil
+	}
+	ctx := svc.warmupCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	newSched := warmup.NewScheduler(svc.coreManager, *wopts)
+	newSched.Start(ctx)
+	svc.warmupMu.Lock()
+	svc.warmupScheduler = newSched
+	svc.warmupMu.Unlock()
+	return nil
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -107,7 +184,6 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewGeminiAuthenticator(),
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
-		sdkAuth.NewQwenAuthenticator(),
 	)
 }
 
@@ -312,6 +388,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// This operation may block on network calls, but the auth configuration
 	// is already effective at this point.
 	s.registerModelsForAuth(auth)
+	s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 
 	// Refresh the scheduler entry so that the auth's supportedModelSet is rebuilt
 	// from the now-populated global model registry. Without this, newly added auths
@@ -392,7 +469,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 	}
 	// Skip disabled auth entries when (re)binding executors.
 	// Disabled auths can linger during config reloads (e.g., removed OpenAI-compat entries)
-	// and must not override active provider executors (such as iFlow OAuth accounts).
+	// and must not override active provider executors.
 	if a.Disabled {
 		return
 	}
@@ -422,10 +499,6 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
-	case "qwen":
-		s.coreManager.RegisterExecutor(executor.NewQwenExecutor(s.cfg))
-	case "iflow":
-		s.coreManager.RegisterExecutor(executor.NewIFlowExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	default:
@@ -614,9 +687,13 @@ func (s *Service) Run(ctx context.Context) error {
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
 		previousStrategy := ""
+		var previousSessionAffinity bool
+		var previousSessionAffinityTTL string
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+			previousSessionAffinity = s.cfg.Routing.ClaudeCodeSessionAffinity || s.cfg.Routing.SessionAffinity
+			previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
 		}
 		s.cfgMu.RUnlock()
 
@@ -640,7 +717,15 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		previousStrategy = normalizeStrategy(previousStrategy)
 		nextStrategy = normalizeStrategy(nextStrategy)
-		if s.coreManager != nil && previousStrategy != nextStrategy {
+
+		nextSessionAffinity := newCfg.Routing.ClaudeCodeSessionAffinity || newCfg.Routing.SessionAffinity
+		nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
+
+		selectorChanged := previousStrategy != nextStrategy ||
+			previousSessionAffinity != nextSessionAffinity ||
+			previousSessionAffinityTTL != nextSessionAffinityTTL
+
+		if s.coreManager != nil && selectorChanged {
 			var selector coreauth.Selector
 			switch nextStrategy {
 			case "fill-first":
@@ -648,6 +733,20 @@ func (s *Service) Run(ctx context.Context) error {
 			default:
 				selector = &coreauth.RoundRobinSelector{}
 			}
+
+			if nextSessionAffinity {
+				ttl := time.Hour
+				if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
+					if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
+						ttl = parsed
+					}
+				}
+				selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+					Fallback: selector,
+					TTL:      ttl,
+				})
+			}
+
 			s.coreManager.SetSelector(selector)
 		}
 
@@ -691,6 +790,28 @@ func (s *Service) Run(ctx context.Context) error {
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 
+	// Start OAuth warmup scheduler if configured. Failures are logged and do
+	// not block server startup — warmup is a latency optimization, not critical.
+	// The scheduler inherits the service context so Stop is called automatically
+	// if Shutdown is bypassed (e.g. panic in shutdownOnce).
+	if s.coreManager != nil {
+		s.warmupCtx = ctx
+		if wopts, wErr := warmup.ParseOptions(s.cfg.Warmup); wErr != nil {
+			log.Warnf("warmup scheduler disabled: invalid config: %v", wErr)
+		} else if wopts != nil {
+			s.warmupScheduler = warmup.NewScheduler(s.coreManager, *wopts)
+			s.warmupScheduler.Start(ctx)
+		}
+		// Wire the management API to the warmup subsystem (always, so even when
+		// disabled today the operator can flip Enabled via the UI and get a live
+		// scheduler without restarting).
+		if s.server != nil {
+			if mh := s.server.ManagementHandler(); mh != nil {
+				mh.SetWarmupController(&warmupAdapter{svc: s})
+			}
+		}
+	}
+
 	select {
 	case <-ctx.Done():
 		log.Debug("service context cancelled, shutting down...")
@@ -721,6 +842,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		// legacy refresh loop removed; only stopping core auth manager below
 
+		if s.warmupScheduler != nil {
+			s.warmupScheduler.Stop()
+		}
 		if s.watcherCancel != nil {
 			s.watcherCancel()
 		}
@@ -902,12 +1026,6 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 		models = applyExcludedModels(models, excluded)
-	case "qwen":
-		models = registry.GetQwenModels()
-		models = applyExcludedModels(models, excluded)
-	case "iflow":
-		models = registry.GetIFlowModels()
-		models = applyExcludedModels(models, excluded)
 	case "kimi":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
@@ -1027,6 +1145,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 		s.ensureExecutorsForAuth(current)
 	}
 	s.registerModelsForAuth(current)
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), current.ID)
 
 	latest, ok := s.latestAuthForModelRegistration(current.ID)
 	if !ok || latest.Disabled {
@@ -1040,6 +1159,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	// no auth fields changed, but keeps the refresh path simple and correct.
 	s.ensureExecutorsForAuth(latest)
 	s.registerModelsForAuth(latest)
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), latest.ID)
 	s.coreManager.RefreshSchedulerEntry(current.ID)
 	return true
 }
@@ -1392,7 +1512,7 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "openai", "openai")
+	return registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
 }
 
 func rewriteModelInfoName(name, oldID, newID string) string {

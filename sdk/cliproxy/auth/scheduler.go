@@ -97,6 +97,72 @@ type childBucket struct {
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
 type cooldownQueue []*scheduledAuth
 
+type readyViewCursorState struct {
+	cursor       int
+	parentCursor int
+	childCursors map[string]int
+}
+
+type readyBucketCursorState struct {
+	all readyViewCursorState
+	ws  readyViewCursorState
+}
+
+func snapshotReadyViewCursors(view readyView) readyViewCursorState {
+	state := readyViewCursorState{
+		cursor:       view.cursor,
+		parentCursor: view.parentCursor,
+	}
+	if len(view.children) == 0 {
+		return state
+	}
+	state.childCursors = make(map[string]int, len(view.children))
+	for parent, child := range view.children {
+		if child == nil {
+			continue
+		}
+		state.childCursors[parent] = child.cursor
+	}
+	return state
+}
+
+func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
+	if view == nil {
+		return
+	}
+	if len(view.flat) > 0 {
+		view.cursor = normalizeCursor(state.cursor, len(view.flat))
+	}
+	if len(view.parentOrder) == 0 || len(view.children) == 0 {
+		return
+	}
+	view.parentCursor = normalizeCursor(state.parentCursor, len(view.parentOrder))
+	if len(state.childCursors) == 0 {
+		return
+	}
+	for parent, child := range view.children {
+		if child == nil || len(child.items) == 0 {
+			continue
+		}
+		cursor, ok := state.childCursors[parent]
+		if !ok {
+			continue
+		}
+		child.cursor = normalizeCursor(cursor, len(child.items))
+	}
+}
+
+func normalizeCursor(cursor, size int) int {
+	if size <= 0 || cursor <= 0 {
+		return 0
+	}
+	cursor = cursor % size
+	if cursor < 0 {
+		cursor += size
+	}
+	return cursor
+}
+
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
@@ -361,11 +427,11 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
 }
 
-// mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
+// mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown error
+// when every candidate across the listed providers is blocked for any reason.
 func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, tried map[string]struct{}) error {
 	now := time.Now()
 	total := 0
-	cooldownCount := 0
 	earliest := time.Time{}
 	for _, providerKey := range providers {
 		providerState := s.providers[providerKey]
@@ -376,9 +442,8 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if shard == nil {
 			continue
 		}
-		localTotal, localCooldownCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried))
+		localTotal, _, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried))
 		total += localTotal
-		cooldownCount += localCooldownCount
 		if !localEarliest.IsZero() && (earliest.IsZero() || localEarliest.Before(earliest)) {
 			earliest = localEarliest
 		}
@@ -386,14 +451,7 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if cooldownCount == total && !earliest.IsZero() {
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return newModelCooldownError(model, "", resetIn)
-	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return makeCooldownError(model, "", earliest, now)
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
@@ -774,25 +832,16 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 	return len(bucket.all.flat)
 }
 
-// unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
+// unavailableErrorLocked returns a 429 model_cooldown error for the shard.
+// When every candidate is blocked for any reason (cooldown, rate-limit,
+// payment error, etc.), callers get the earliest recovery time as a retry hint.
 func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool) error {
 	now := time.Now()
-	total, cooldownCount, earliest := m.availabilitySummaryLocked(predicate)
+	total, _, earliest := m.availabilitySummaryLocked(predicate)
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if cooldownCount == total && !earliest.IsZero() {
-		providerForError := provider
-		if providerForError == "mixed" {
-			providerForError = ""
-		}
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return newModelCooldownError(model, providerForError, resetIn)
-	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return makeCooldownError(model, provider, earliest, now)
 }
 
 // availabilitySummaryLocked summarizes total candidates, cooldown count, and earliest retry time.
@@ -811,12 +860,13 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		if entry == nil || entry.auth == nil {
 			continue
 		}
-		if entry.state != scheduledStateCooldown {
-			continue
-		}
-		cooldownCount++
-		if !entry.nextRetryAt.IsZero() && (earliest.IsZero() || entry.nextRetryAt.Before(earliest)) {
-			earliest = entry.nextRetryAt
+		// Count ALL blocked states (cooldown + blocked) as unavailable, and track
+		// earliest recovery time across all of them so callers always get a retry hint.
+		if entry.state == scheduledStateCooldown || entry.state == scheduledStateBlocked {
+			cooldownCount++
+			if !entry.nextRetryAt.IsZero() && (earliest.IsZero() || entry.nextRetryAt.Before(earliest)) {
+				earliest = entry.nextRetryAt
+			}
 		}
 	}
 	return total, cooldownCount, earliest
@@ -824,6 +874,17 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.
 func (m *modelScheduler) rebuildIndexesLocked() {
+	cursorStates := make(map[int]readyBucketCursorState, len(m.readyByPriority))
+	for priority, bucket := range m.readyByPriority {
+		if bucket == nil {
+			continue
+		}
+		cursorStates[priority] = readyBucketCursorState{
+			all: snapshotReadyViewCursors(bucket.all),
+			ws:  snapshotReadyViewCursors(bucket.ws),
+		}
+	}
+
 	m.readyByPriority = make(map[int]*readyBucket)
 	m.priorityOrder = m.priorityOrder[:0]
 	m.blocked = m.blocked[:0]
@@ -844,7 +905,12 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		sort.Slice(entries, func(i, j int) bool {
 			return entries[i].auth.ID < entries[j].auth.ID
 		})
-		m.readyByPriority[priority] = buildReadyBucket(entries)
+		bucket := buildReadyBucket(entries)
+		if cursorState, ok := cursorStates[priority]; ok && bucket != nil {
+			restoreReadyViewCursors(&bucket.all, cursorState.all)
+			restoreReadyViewCursors(&bucket.ws, cursorState.ws)
+		}
+		m.readyByPriority[priority] = bucket
 		m.priorityOrder = append(m.priorityOrder, priority)
 	}
 	sort.Slice(m.priorityOrder, func(i, j int) bool {

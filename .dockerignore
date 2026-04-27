@@ -21,6 +21,9 @@ logs/*
 conv/*
 config.yaml
 
+# Frontend checkout dir (used by CI to build panel, excluded from image)
+_frontend/*
+
 # Development/editor
 bin/*
 .vscode/*

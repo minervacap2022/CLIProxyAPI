@@ -69,10 +69,14 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 
 	// Create a valid auth file
 	authData := map[string]any{
-		"type":            "claude",
-		"email":           "test@example.com",
-		"proxy_url":       "http://proxy.local",
-		"prefix":          "test-prefix",
+		"type":      "claude",
+		"email":     "test@example.com",
+		"proxy_url": "http://proxy.local",
+		"prefix":    "test-prefix",
+		"headers": map[string]string{
+			" X-Test ": " value ",
+			"X-Empty":  "  ",
+		},
 		"disable_cooling": true,
 		"request_retry":   2,
 	}
@@ -109,6 +113,12 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 	if auths[0].ProxyURL != "http://proxy.local" {
 		t.Errorf("expected proxy_url http://proxy.local, got %s", auths[0].ProxyURL)
+	}
+	if got := auths[0].Attributes["header:X-Test"]; got != "value" {
+		t.Errorf("expected header:X-Test value, got %q", got)
+	}
+	if _, ok := auths[0].Attributes["header:X-Empty"]; ok {
+		t.Errorf("expected header:X-Empty to be absent, got %q", auths[0].Attributes["header:X-Empty"])
 	}
 	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || !v {
 		t.Errorf("expected disable_cooling true, got %v", auths[0].Metadata["disable_cooling"])
@@ -450,8 +460,9 @@ func TestSynthesizeGeminiVirtualAuths_MultiProject(t *testing.T) {
 		Prefix:   "test-prefix",
 		ProxyURL: "http://proxy.local",
 		Attributes: map[string]string{
-			"source": "test-source",
-			"path":   "/path/to/auth",
+			"source":       "test-source",
+			"path":         "/path/to/auth",
+			"header:X-Tra": "value",
 		},
 	}
 	metadata := map[string]any{
@@ -505,6 +516,9 @@ func TestSynthesizeGeminiVirtualAuths_MultiProject(t *testing.T) {
 		}
 		if v.Attributes["runtime_only"] != "true" {
 			t.Error("expected runtime_only=true")
+		}
+		if got := v.Attributes["header:X-Tra"]; got != "value" {
+			t.Errorf("expected virtual %d header:X-Tra %q, got %q", i, "value", got)
 		}
 		if v.Attributes["gemini_virtual_parent"] != "primary-id" {
 			t.Errorf("expected gemini_virtual_parent=primary-id, got %s", v.Attributes["gemini_virtual_parent"])
@@ -939,5 +953,109 @@ func TestFileSynthesizer_Synthesize_MultiProjectGeminiWithNote(t *testing.T) {
 		if gotPriority := v.Attributes["priority"]; gotPriority != "5" {
 			t.Errorf("expected virtual %d priority %q, got %q", i, "5", gotPriority)
 		}
+	}
+}
+
+func TestFileSynthesizer_Synthesize_DisablesConfiguredProviderRefresh(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Write claude-auth.json with type=claude
+	authData := map[string]any{
+		"type":  "claude",
+		"email": "shadow@example.com",
+	}
+	data, _ := json.Marshal(authData)
+	err := os.WriteFile(filepath.Join(tempDir, "claude-auth.json"), data, 0644)
+	if err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			OAuthRefreshDisabledProviders: []string{"claude"},
+		},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+
+	// Expect runtime to be set for disabled provider
+	if auths[0].Runtime == nil {
+		t.Error("expected auths[0].Runtime != nil, got nil")
+	}
+
+	// Verify the runtime actually suppresses refresh
+	runtime := auths[0].Runtime
+	if runtime == nil {
+		t.Fatal("runtime is nil, cannot test refresh behavior")
+	}
+
+	// Check RefreshLead() method
+	refreshLeadImpl, ok := runtime.(interface{ RefreshLead() *time.Duration })
+	if !ok {
+		t.Error("runtime does not implement RefreshLead() *time.Duration")
+	} else {
+		lead := refreshLeadImpl.RefreshLead()
+		if lead != nil {
+			t.Errorf("expected RefreshLead() == nil, got %v", lead)
+		}
+	}
+
+	// Check ShouldRefresh() method
+	shouldRefreshImpl, ok := runtime.(interface{ ShouldRefresh(time.Time, *coreauth.Auth) bool })
+	if !ok {
+		t.Error("runtime does not implement ShouldRefresh(time.Time, *coreauth.Auth) bool")
+	} else {
+		result := shouldRefreshImpl.ShouldRefresh(time.Now(), auths[0])
+		if result != false {
+			t.Errorf("expected ShouldRefresh() == false for disabled provider, got %v", result)
+		}
+	}
+}
+
+func TestFileSynthesizer_Synthesize_LeavesOtherProvidersRefreshable(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Write kimi-auth.json with type=kimi
+	authData := map[string]any{
+		"type":  "kimi",
+		"email": "other@example.com",
+	}
+	data, _ := json.Marshal(authData)
+	err := os.WriteFile(filepath.Join(tempDir, "kimi-auth.json"), data, 0644)
+	if err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			OAuthRefreshDisabledProviders: []string{"claude"},
+		},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+
+	// Expect runtime to be nil for non-disabled provider
+	if auths[0].Runtime != nil {
+		t.Error("expected auths[0].Runtime == nil, got non-nil")
 	}
 }

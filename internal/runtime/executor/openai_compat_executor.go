@@ -158,7 +158,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		sErr := statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if httpResp.StatusCode == 429 {
+			sErr.retryAfter = parseDoubaoRetryAfter(b)
+		}
+		err = sErr
 		return resp, err
 	}
 	body, err := io.ReadAll(httpResp.Body)
@@ -259,8 +263,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return nil, err
+		sErr := statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if httpResp.StatusCode == 429 {
+			sErr.retryAfter = parseDoubaoRetryAfter(b)
+		}
+		return nil, sErr
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -298,6 +305,14 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		} else {
+			// In case the upstream close the stream without a terminal [DONE] marker.
+			// Feed a synthetic done marker through the translator so pending
+			// response.completed events are still emitted exactly once.
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
+			for i := range chunks {
+				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+			}
 		}
 		// Ensure we record the request if no usage chunk was ever seen
 		reporter.EnsurePublished(ctx)
@@ -386,6 +401,51 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
 }
+
+// parseDoubaoRetryAfter extracts the retry-after duration from a Doubao/Volcengine 429 body.
+//
+// Two cases are handled:
+//
+//  1. AccountQuotaExceeded — body contains "reset at <timestamp>"; returns exact duration
+//     until that timestamp so the auth is locked precisely until the quota resets.
+//
+//  2. RequestBurstTooFast — Volcengine burst/ramp-up protection; returns a fixed short
+//     cooldown (doubaoB urstCooldown) instead of nil, which would otherwise trigger
+//     exponential backoff and create a retry storm.
+//
+// Returns nil for all other 429 variants (exponential backoff applies).
+func parseDoubaoRetryAfter(body []byte) *time.Duration {
+	// Case 1: exact quota reset timestamp
+	const resetPrefix = "reset at "
+	msg := string(body)
+	if idx := strings.Index(msg, resetPrefix); idx != -1 {
+		raw := strings.TrimSpace(msg[idx+len(resetPrefix):])
+		end := strings.IndexAny(raw, ".\"")
+		if end == -1 {
+			end = len(raw)
+		}
+		raw = strings.TrimSpace(raw[:end])
+		// Doubao format: "2006-01-02 15:04:05 +0800 CST"
+		if t, err := time.Parse("2006-01-02 15:04:05 -0700 MST", raw); err == nil {
+			if d := time.Until(t); d > 0 {
+				return &d
+			}
+		}
+	}
+
+	// Case 2: burst / ramp-up protection — short fixed cooldown to break retry storm
+	if strings.Contains(msg, "RequestBurstTooFast") {
+		d := doubaoBurstCooldown
+		return &d
+	}
+
+	return nil
+}
+
+// doubaoBurstCooldown is the fixed retry delay applied when Volcengine returns
+// RequestBurstTooFast. It is long enough to let burst protection clear, but short
+// enough not to cause noticeable downtime when the key is otherwise healthy.
+const doubaoBurstCooldown = 15 * time.Second
 
 type statusErr struct {
 	code       int
