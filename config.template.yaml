@@ -18,6 +18,14 @@ auth-dir: "/root/.cli-proxy-api"
 api-keys:
   - "your-client-api-key"
 
+# ── Optional: OAuth warmup scheduler ──────────────────────────────────────────
+# For temporary shadow instances that share OAuth credentials with primary,
+# prefer disabling warmup entirely. Do not leave warmup.providers empty if you
+# mean "exclude claude" — empty means all supported providers.
+#
+# warmup:
+#   enabled: false
+
 # ── Optional: model groups for priority failover ────────────────────────────
 # api-key-configs:
 #   - key: "your-client-api-key"

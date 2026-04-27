@@ -224,6 +224,23 @@ func TestParseOptions_ModelOverrideUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestParseOptions_ExplicitProviderAllowlistExcludesClaude(t *testing.T) {
+	opts, err := ParseOptions(config.WarmupConfig{
+		Enabled:   true,
+		OnStartup: true,
+		Providers: []string{"kimi"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := opts.Providers["kimi"]; !ok {
+		t.Fatal("expected kimi in allowlist")
+	}
+	if _, ok := opts.Providers["claude"]; ok {
+		t.Fatal("did not expect claude in allowlist")
+	}
+}
+
 func TestEligible(t *testing.T) {
 	shanghai, _ := time.LoadLocation("Asia/Shanghai")
 	s := &Scheduler{opts: Options{
