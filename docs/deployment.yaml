@@ -75,6 +75,9 @@ config:
   frontend_paths:  ["panel/", "management.html"]
   docs_paths:      ["docs/", "*.md"]
   backend_test_command: "go test -race ./internal/thinking/... ./internal/runtime/executor/... ./internal/api/modules/amp/..."
+  shadow_cleanup_enabled: true                          # enable automatic shadow cleanup after primary stability window
+  primary_stability_window_seconds: 180                 # observe promoted primary before removing temporary shadow
+  primary_stability_check_interval_seconds: 15          # interval for checking primary health during stability window
   wait_healthy_timeout_seconds: 30
   rollback_window_hours: 24
 
@@ -473,6 +476,38 @@ pipeline:
             - log_error_scan
           target: primary
           on_failure: rollback.primary_revert
+
+    # -----------------------------------------------------------------------
+    - id: primary_stability
+      description: "observe promoted primary before removing temporary shadow"
+      steps:
+        - id: observe_primary_stability
+          run: |
+            end=$(( $(date +%s) + {{config.primary_stability_window_seconds}} ))
+            while [ "$(date +%s)" -lt "$end" ]; do
+              curl -fsS "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.health_path}}" >/dev/null
+              curl -fsS -o /dev/null -w '%{http_code}\n' \
+                "http://{{targets.primary.host}}:{{targets.primary.host_port}}{{config.management_path}}" \
+                | grep -qx '200'
+              docker logs --tail 100 "{{targets.primary.container}}" 2>&1 \
+                | grep -iE 'error|panic|fatal' && exit 1 || true
+              sleep {{config.primary_stability_check_interval_seconds}}
+            done
+          on_failure: abort
+
+    # -----------------------------------------------------------------------
+    - id: shadow_cleanup
+      description: "remove temporary shadow after primary proves stable"
+      steps:
+        - id: remove_temporary_shadow
+          when: '{{config.shadow_cleanup_enabled}} == true'
+          run: |
+            if ! docker inspect "{{targets.shadow.container}}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            docker stop "{{targets.shadow.container}}"
+            docker rm "{{targets.shadow.container}}"
+          on_failure: abort
 
     # -----------------------------------------------------------------------
     - id: record
