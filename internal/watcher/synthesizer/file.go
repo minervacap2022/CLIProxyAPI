@@ -159,6 +159,12 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
+	if cfg != nil {
+		runtimeOverride := newRefreshControlRuntime(cfg.OAuthRefreshDisabledProviders)
+		if runtimeOverride != nil && runtimeOverride.refreshDisabled(provider) {
+			a.Runtime = runtimeOverride
+		}
+	}
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {

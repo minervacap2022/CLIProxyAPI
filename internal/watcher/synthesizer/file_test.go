@@ -955,3 +955,107 @@ func TestFileSynthesizer_Synthesize_MultiProjectGeminiWithNote(t *testing.T) {
 		}
 	}
 }
+
+func TestFileSynthesizer_Synthesize_DisablesConfiguredProviderRefresh(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Write claude-auth.json with type=claude
+	authData := map[string]any{
+		"type":  "claude",
+		"email": "shadow@example.com",
+	}
+	data, _ := json.Marshal(authData)
+	err := os.WriteFile(filepath.Join(tempDir, "claude-auth.json"), data, 0644)
+	if err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			OAuthRefreshDisabledProviders: []string{"claude"},
+		},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+
+	// Expect runtime to be set for disabled provider
+	if auths[0].Runtime == nil {
+		t.Error("expected auths[0].Runtime != nil, got nil")
+	}
+
+	// Verify the runtime actually suppresses refresh
+	runtime := auths[0].Runtime
+	if runtime == nil {
+		t.Fatal("runtime is nil, cannot test refresh behavior")
+	}
+
+	// Check RefreshLead() method
+	refreshLeadImpl, ok := runtime.(interface{ RefreshLead() *time.Duration })
+	if !ok {
+		t.Error("runtime does not implement RefreshLead() *time.Duration")
+	} else {
+		lead := refreshLeadImpl.RefreshLead()
+		if lead != nil {
+			t.Errorf("expected RefreshLead() == nil, got %v", lead)
+		}
+	}
+
+	// Check ShouldRefresh() method
+	shouldRefreshImpl, ok := runtime.(interface{ ShouldRefresh(time.Time, *coreauth.Auth) bool })
+	if !ok {
+		t.Error("runtime does not implement ShouldRefresh(time.Time, *coreauth.Auth) bool")
+	} else {
+		result := shouldRefreshImpl.ShouldRefresh(time.Now(), auths[0])
+		if result != false {
+			t.Errorf("expected ShouldRefresh() == false for disabled provider, got %v", result)
+		}
+	}
+}
+
+func TestFileSynthesizer_Synthesize_LeavesOtherProvidersRefreshable(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Write kimi-auth.json with type=kimi
+	authData := map[string]any{
+		"type":  "kimi",
+		"email": "other@example.com",
+	}
+	data, _ := json.Marshal(authData)
+	err := os.WriteFile(filepath.Join(tempDir, "kimi-auth.json"), data, 0644)
+	if err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			OAuthRefreshDisabledProviders: []string{"claude"},
+		},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+
+	// Expect runtime to be nil for non-disabled provider
+	if auths[0].Runtime != nil {
+		t.Error("expected auths[0].Runtime == nil, got non-nil")
+	}
+}
