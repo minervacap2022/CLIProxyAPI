@@ -154,3 +154,31 @@ func TestNextRefreshCheckAt_RefreshEvaluatorFallback(t *testing.T) {
 		t.Fatalf("nextRefreshCheckAt() = %s, want %s", got, want)
 	}
 }
+
+func TestNextRefreshCheckAt_ProviderLeadStillSchedulesWithoutRuntimeOverride(t *testing.T) {
+	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	expiry := now.Add(8 * time.Hour)
+	lead := 4 * time.Hour
+	setRefreshLeadFactory(t, "claude", func() *time.Duration {
+		d := lead
+		return &d
+	})
+
+	auth := &Auth{
+		ID:       "claude-1",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"email":   "main@example.com",
+			"expired": expiry.Format(time.RFC3339),
+		},
+	}
+
+	got, ok := nextRefreshCheckAt(now, auth, 15*time.Minute)
+	if !ok {
+		t.Fatal("expected claude auth to remain scheduled")
+	}
+	want := expiry.Add(-lead)
+	if !got.Equal(want) {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+}
