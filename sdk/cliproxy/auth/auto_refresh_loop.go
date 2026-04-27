@@ -349,6 +349,14 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		return auth.NextRefreshAfter, true
 	}
 
+	if auth.Runtime != nil {
+		if eval, ok := auth.Runtime.(interface{ RefreshLead() *time.Duration }); ok {
+			if lead := eval.RefreshLead(); lead == nil || *lead <= 0 {
+				return time.Time{}, false
+			}
+		}
+	}
+
 	if evaluator, ok := auth.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		if interval <= 0 {
 			interval = refreshCheckInterval

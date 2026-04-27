@@ -117,6 +117,25 @@ func TestNextRefreshCheckAt_ProviderLead_Expiry(t *testing.T) {
 	}
 }
 
+type disabledRefreshRuntime struct{}
+
+func (disabledRefreshRuntime) ShouldRefresh(time.Time, *Auth) bool { return false }
+func (disabledRefreshRuntime) RefreshLead() *time.Duration         { return nil }
+
+func TestNextRefreshCheckAt_RuntimeRefreshLeadNilUnschedules(t *testing.T) {
+	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:       "a1",
+		Provider: "claude",
+		Metadata: map[string]any{"email": "x@example.com"},
+		Runtime:  disabledRefreshRuntime{},
+	}
+
+	if _, ok := nextRefreshCheckAt(now, auth, 15*time.Minute); ok {
+		t.Fatalf("nextRefreshCheckAt() ok = true, want false")
+	}
+}
+
 func TestNextRefreshCheckAt_RefreshEvaluatorFallback(t *testing.T) {
 	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
 	interval := 15 * time.Minute
