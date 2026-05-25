@@ -908,12 +908,48 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 		// Route to Claude handler if User-Agent starts with "claude-cli"
 		if strings.HasPrefix(userAgent, "claude-cli") {
 			// log.Debugf("Routing /v1/models to Claude handler for User-Agent: %s", userAgent)
-			claudeHandler.ClaudeModels(c)
+			s.serveModelsWithGroups(c, claudeHandler.Models())
 		} else {
 			// log.Debugf("Routing /v1/models to OpenAI handler for User-Agent: %s", userAgent)
-			openaiHandler.OpenAIModels(c)
+			s.serveModelsWithGroups(c, openaiHandler.Models())
 		}
 	}
+}
+
+// serveModelsWithGroups appends configured model-group names as virtual model
+// entries so that clients (e.g. Claude Code) can discover and select a group
+// name directly from the /v1/models listing.
+func (s *Server) serveModelsWithGroups(c *gin.Context, models []map[string]any) {
+	if s.cfg != nil {
+		for _, mg := range s.cfg.ModelGroups {
+			models = append(models, map[string]any{
+				"id":          mg.Name,
+				"object":      "model",
+				"created":     0,
+				"owned_by":    "model-group",
+				"type":        "model-group",
+				"display_name": mg.Name,
+			})
+		}
+	}
+
+	firstID := ""
+	lastID := ""
+	if len(models) > 0 {
+		if id, ok := models[0]["id"].(string); ok {
+			firstID = id
+		}
+		if id, ok := models[len(models)-1]["id"].(string); ok {
+			lastID = id
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":     models,
+		"has_more": false,
+		"first_id": firstID,
+		"last_id":  lastID,
+	})
 }
 
 func (s *Server) handleHomeCodexClientModels(c *gin.Context) {
@@ -1585,7 +1621,7 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 //   - "modelGroup"    → *config.ModelGroup   (nil when key has no model group)
 func (s *Server) keyConfigMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		apiKeyRaw, exists := c.Get("apiKey")
+		apiKeyRaw, exists := c.Get("userApiKey")
 		if !exists {
 			c.Next()
 			return
