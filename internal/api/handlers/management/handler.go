@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"golang.org/x/crypto/bcrypt"
@@ -57,6 +58,11 @@ type Handler struct {
 	// warmupController is an optional hook to restart / trigger the warmup
 	// scheduler when the warmup config is mutated via the management API.
 	warmupController WarmupController
+
+	// usageStats provides the in-memory usage statistics used by the
+	// /usage, /usage/export, /usage/import legacy endpoints (Klik fork).
+	// May be nil; handlers then fall back to an empty snapshot.
+	usageStats *usage.RequestStatistics
 }
 
 // WarmupController abstracts the warmup scheduler so management handlers can
@@ -178,6 +184,16 @@ func (h *Handler) SetKeyConfigRefreshFunc(f func()) {
 // SetWarmupController wires the warmup scheduler into the management handler
 // so operators can trigger rounds and reload the scheduler after config edits.
 // Passing nil clears the controller (warmup endpoints will return 503).
+// SetUsageStatistics injects the in-memory usage statistics store used by the
+// legacy /usage, /usage/export, /usage/import endpoints. Safe to call with nil
+// to disable those endpoints' data path.
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) {
+	if h == nil {
+		return
+	}
+	h.usageStats = stats
+}
+
 func (h *Handler) SetWarmupController(ctrl WarmupController) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

@@ -164,7 +164,27 @@ type Config struct {
 	// or refresh it periodically.
 	Warmup WarmupConfig `yaml:"warmup,omitempty" json:"warmup,omitempty"`
 
+	// UsagePersistence configures the optional Redis-backed snapshot persistor
+	// for the in-memory usage statistics (internal/usage). When Addr is empty,
+	// usage stats run pure in-memory and are lost on restart (the original
+	// upstream v6 behaviour). Klik-specific.
+	UsagePersistence UsagePersistenceConfig `yaml:"usage-persistence,omitempty" json:"usage-persistence,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// UsagePersistenceConfig drives internal/usage.Persistor.
+type UsagePersistenceConfig struct {
+	// Addr is the Redis endpoint, e.g. "127.0.0.1:6379". Empty disables persistence.
+	Addr string `yaml:"addr,omitempty" json:"addr,omitempty"`
+	// Password is the Redis AUTH password (optional).
+	Password string `yaml:"password,omitempty" json:"password,omitempty"`
+	// DB is the Redis logical database index. Default 0.
+	DB int `yaml:"db,omitempty" json:"db,omitempty"`
+	// Key is the Redis key used for the snapshot blob. Default "cpa:usage:snapshot".
+	Key string `yaml:"key,omitempty" json:"key,omitempty"`
+	// FlushIntervalSeconds controls how often the snapshot is written. Default 5.
+	FlushIntervalSeconds int `yaml:"flush-interval-seconds,omitempty" json:"flush-interval-seconds,omitempty"`
 }
 
 // WarmupConfig controls the OAuth warmup scheduler.

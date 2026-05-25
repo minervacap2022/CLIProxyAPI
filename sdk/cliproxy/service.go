@@ -25,6 +25,7 @@ import (
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 
@@ -111,6 +112,11 @@ type Service struct {
 
 	homeClient *home.Client
 	homeCancel context.CancelFunc
+
+	// usagePersistor optionally persists the in-memory usage stats snapshot
+	// to Redis on a schedule. Nil when redis is not configured / unreachable
+	// (the stats keep running in pure in-memory mode in that case).
+	usagePersistor *internalusage.Persistor
 }
 
 // warmupAdapter bridges the management-handler WarmupController interface and
@@ -837,6 +843,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	usage.StartDefault(ctx)
+	s.startUsagePersistor(ctx)
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)
@@ -1124,8 +1131,51 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		usage.StopDefault()
+		if s.usagePersistor != nil {
+			s.usagePersistor.Stop()
+			s.usagePersistor = nil
+		}
 	})
 	return shutdownErr
+}
+
+// startUsagePersistor wires the in-memory usage stats to a Redis-backed
+// snapshot persistor when cfg.UsagePersistence.Addr is set. On failure we
+// log loudly and continue in pure in-memory mode (no fatal).
+func (s *Service) startUsagePersistor(ctx context.Context) {
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	if cfg == nil || cfg.UsagePersistence.Addr == "" {
+		return
+	}
+	stats := internalusage.GetRequestStatistics()
+	if stats == nil {
+		log.Warn("usage persistence: in-memory stats unavailable; skipping persistor")
+		return
+	}
+	opts := internalusage.PersistOptions{
+		Addr:     cfg.UsagePersistence.Addr,
+		Password: cfg.UsagePersistence.Password,
+		DB:       cfg.UsagePersistence.DB,
+		Key:      cfg.UsagePersistence.Key,
+	}
+	if cfg.UsagePersistence.FlushIntervalSeconds > 0 {
+		opts.FlushInterval = time.Duration(cfg.UsagePersistence.FlushIntervalSeconds) * time.Second
+	}
+	persistor, err := internalusage.NewPersistor(opts, stats)
+	if err != nil {
+		log.WithError(err).Error("usage persistence: redis unavailable; continuing in pure in-memory mode (data will be lost on restart)")
+		return
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := persistor.LoadSnapshot(loadCtx); err != nil {
+		log.WithError(err).Warn("usage persistence: snapshot load failed; starting fresh")
+	}
+	persistor.Start(ctx)
+	s.usagePersistor = persistor
+	log.Infof("usage persistence: enabled (addr=%s db=%d key=%s flush=%s)", opts.Addr, opts.DB, opts.Key, opts.FlushInterval)
 }
 
 func (s *Service) ensureAuthDir() error {
