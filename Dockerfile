@@ -21,7 +21,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
       -X 'main.BuildDate=${BUILD_DATE}'" \
     -o ./CLIProxyAPI ./cmd/server/
 
-FROM alpine:3.22.0
+FROM alpine:3.23
 
 RUN apk add --no-cache tzdata ca-certificates
 

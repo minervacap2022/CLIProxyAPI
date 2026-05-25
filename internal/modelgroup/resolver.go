@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 // Tier represents a single priority level within a model group.
