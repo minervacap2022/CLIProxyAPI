@@ -3,12 +3,11 @@ services:
         image: ${CLI_PROXY_IMAGE:-ghcr.io/minervacap2022/cliproxyapi:latest}
         pull_policy: always
         container_name: cliproxyapi
+        network_mode: host
         environment:
             - MANAGEMENT_STATIC_PATH=/CLIProxyAPI/panel/management.html
             # Plaintext management secret — enables remote management panel access
             # Visit http://your-server:8317/management.html after startup
-        ports:
-            - "${PORT:-8318}:8318"
         volumes:
             # Config persists API keys, model groups, and other settings across restarts
             - ${CLI_PROXY_CONFIG_PATH:-/opt/cpa/config.yaml}:/CLIProxyAPI/config.yaml
@@ -16,4 +15,6 @@ services:
             - ${CLI_PROXY_AUTH_PATH:-/opt/cpa/auths}:/root/.cli-proxy-api
             # Optional: persist logs
             - ${CLI_PROXY_LOG_PATH:-/opt/cpa/logs}:/CLIProxyAPI/logs
+            # Persist custom management panel patch across container recreation
+            - ./panel/management.html:/CLIProxyAPI/panel/management.html:ro
         restart: unless-stopped

@@ -8,9 +8,36 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-// GetAPIKeyConfigs returns the current api-key-configs list.
+// GetAPIKeyConfigs returns api-key-configs plus read-visible rows for flat api-keys
+// that do not yet have per-key config. The flat api-keys list is the auth
+// source of truth, so the management UI must show those keys instead of hiding
+// active keys that can accumulate usage. Synthetic rows are not persisted unless
+// the caller later PATCHes/PUTs them.
 func (h *Handler) GetAPIKeyConfigs(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"api-key-configs": h.cfg.APIKeyConfigs})
+	configs := append([]config.APIKeyConfig(nil), h.cfg.APIKeyConfigs...)
+	seen := make(map[string]struct{}, len(configs))
+	for _, kc := range configs {
+		key := strings.TrimSpace(kc.Key)
+		if key != "" {
+			seen[key] = struct{}{}
+		}
+	}
+	for _, raw := range h.cfg.APIKeys {
+		key := strings.TrimSpace(raw)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		label := "Unconfigured key"
+		if strings.HasPrefix(key, "cli-proxy-api-default-auto-created-") {
+			label = "Default auto-created"
+		}
+		configs = append(configs, config.APIKeyConfig{Key: key, Label: label, AllowOtherModels: true})
+		seen[key] = struct{}{}
+	}
+	c.JSON(http.StatusOK, gin.H{"api-key-configs": configs})
 }
 
 // PutAPIKeyConfigs replaces the entire api-key-configs list and re-merges the flat api-keys list.

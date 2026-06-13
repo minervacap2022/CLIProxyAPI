@@ -192,5 +192,300 @@ ${i.comment}`:i.comment}this.doc.range[2]=i.offset;break}default:this.errors.pus
   </head>
   <body>
     <div id="root"></div>
-  </body>
+  
+<script id="cpa-team-page-addon">
+(function(){
+  'use strict';
+  if (window.__CPA_TEAM_PAGE__ && window.__CPA_TEAM_PAGE__.installed) return;
+  const TEAM = window.__CPA_TEAM_PAGE__ = { installed: true };
+  const AUTH_STORE = 'cli-proxy-auth';
+  const STORAGE_PREFIX = 'enc::v1::';
+  const STORAGE_KEY = 'cli-proxy-api-webui::secure-storage';
+  const MANAGEMENT_PATH = '/v0/management';
+  const COLORS = ['#5b8def','#22c55e','#f59e0b','#c65746','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#64748b'];
+
+  function bytes(text){ return new TextEncoder().encode(text); }
+  function text(buf){ return new TextDecoder().decode(buf); }
+  function xor(data, key){ const out = new Uint8Array(data.length); for (let i = 0; i < data.length; i++) out[i] = data[i] ^ key[i % key.length]; return out; }
+  function storageKey(){ try { return bytes(STORAGE_KEY + '|' + window.location.host + '|' + navigator.userAgent); } catch (_) { return bytes(STORAGE_KEY); } }
+  function decodeStored(raw){
+    if (!raw) return null;
+    try {
+      let payload = raw;
+      if (payload.startsWith(STORAGE_PREFIX)) {
+        const encoded = atob(payload.slice(STORAGE_PREFIX.length));
+        const data = new Uint8Array(encoded.length);
+        for (let i = 0; i < encoded.length; i++) data[i] = encoded.charCodeAt(i);
+        payload = text(xor(data, storageKey()));
+      }
+      return JSON.parse(payload);
+    } catch (_) { return null; }
+  }
+  function getAuth(){
+    const parsed = decodeStored(localStorage.getItem(AUTH_STORE));
+    const state = parsed && (parsed.state || parsed);
+    const apiBase = cleanBase((state && (state.apiBase || state.apiUrl)) || window.location.origin);
+    const managementKey = String((state && state.managementKey) || '').trim();
+    return { apiBase, managementKey };
+  }
+  function cleanBase(value){
+    let base = String(value || '').trim();
+    if (!base) base = window.location.origin;
+    base = base.replace(/\/?v0\/management\/?$/i, '').replace(/\/+$/g, '');
+    if (!/^https?:\/\//i.test(base)) base = 'http://' + base;
+    return base;
+  }
+  function apiUrl(path){ return cleanBase(getAuth().apiBase) + MANAGEMENT_PATH + path; }
+  async function apiGet(path){
+    const auth = getAuth();
+    const headers = { 'Accept': 'application/json' };
+    if (auth.managementKey) headers.Authorization = 'Bearer ' + auth.managementKey;
+    const res = await fetch(apiUrl(path), { credentials: 'same-origin', headers });
+    if (!res.ok) throw new Error('GET ' + path + ' failed: HTTP ' + res.status);
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) return res.json();
+    const raw = await res.text();
+    try { return JSON.parse(raw); } catch (_) { return raw; }
+  }
+  function isObj(v){ return v && typeof v === 'object' && !Array.isArray(v); }
+  function arr(v){ return Array.isArray(v) ? v : []; }
+  function num(v){ const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; }
+  function fmt(n){ return new Intl.NumberFormat().format(Math.round(Number(n) || 0)); }
+  function pct(n){ return (Number(n) || 0).toFixed(1) + '%'; }
+  function esc(v){ return String(v == null ? '' : v).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+  function looksSecret(v){ return typeof v === 'string' && /(sk-[A-Za-z0-9_-]{6,}|sk-ant-[A-Za-z0-9_-]{6,}|AIza[0-9A-Za-z-_]{8,}|hf_[A-Za-z0-9]{6,}|pk_[A-Za-z0-9]{6,}|rk_[A-Za-z0-9]{6,})/.test(v); }
+  function safeLabel(label, fallback){
+    const s = String(label || '').trim();
+    if (!s || looksSecret(s)) return fallback;
+    return s.length > 80 ? s.slice(0, 77) + '...' : s;
+  }
+  function fnv64(value){
+    let h = 0xcbf29ce484222325n;
+    const p = 0x100000001b3n;
+    const s = String(value || '');
+    for (let i = 0; i < s.length; i++) { h ^= BigInt(s.charCodeAt(i)); h = (h * p) & 0xffffffffffffffffn; }
+    return h.toString(16).padStart(16, '0');
+  }
+  function keyIdsFromConfig(item){
+    const ids = [];
+    const key = String(item.key || item.apiKey || item['api-key'] || '').trim();
+    const prefix = String(item.prefix || '').trim();
+    if (key) { ids.push(key); ids.push('k:' + fnv64(key)); }
+    if (prefix) ids.push('t:' + prefix);
+    return Array.from(new Set(ids));
+  }
+  function configList(resp){
+    const raw = resp && (resp['api-key-configs'] || resp.apiKeyConfigs || resp.value || resp.data || resp);
+    return Array.isArray(raw) ? raw.filter(isObj) : [];
+  }
+  function buildResolver(configs){
+    const byId = new Map();
+    configs.forEach((cfg, i) => {
+      const label = safeLabel(cfg.label || cfg.name || cfg.displayName || cfg.description, 'API key ' + (i + 1));
+      keyIdsFromConfig(cfg).forEach(id => byId.set(id, label));
+    });
+    function configuredLabel(source){
+      const s = String(source || '').trim();
+      if (!s) return null;
+      if (byId.has(s)) return byId.get(s);
+      const embedded = s.match(/sk-[A-Za-z0-9_-]+/);
+      if (embedded && byId.has(embedded[0])) return byId.get(embedded[0]);
+      if (s.startsWith('k:') && byId.has(s)) return byId.get(s);
+      return null;
+    }
+    configuredLabel.configuredCount = configs.length;
+    return configuredLabel;
+  }
+  function tokenParts(tokens){
+    const t = isObj(tokens) ? tokens : {};
+    const input = num(t.input_tokens ?? t.prompt_tokens);
+    const output = num(t.output_tokens ?? t.completion_tokens);
+    const reasoning = num(t.reasoning_tokens);
+    const cacheRead = num(t.cache_read_input_tokens ?? t.cached_tokens ?? t.cache_tokens);
+    const cacheCreate = num(t.cache_creation_input_tokens);
+    const cached = Math.max(cacheRead, num(t.cached_tokens), num(t.cache_tokens));
+    const totalGiven = num(t.total_tokens ?? t.totalTokens ?? t.tokens);
+    const total = totalGiven || input + output + reasoning + Math.max(cached, cacheRead + cacheCreate);
+    return { input, output, reasoning, cacheRead, cacheCreate, total };
+  }
+  function usageRoot(resp){ return resp && (resp.usage || resp.data || resp); }
+  function parseTime(value){ const t = Date.parse(String(value || '')); return Number.isFinite(t) ? t : null; }
+  function pad2(n){ return String(n).padStart(2, '0'); }
+  function toLocalInput(ms){ const d = new Date(ms); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
+  function rangeState(){
+    const now = Date.now();
+    const mode = TEAM.rangeMode || localStorage.getItem('cpa-team-range-mode') || '24h';
+    const savedStart = localStorage.getItem('cpa-team-custom-start') || '';
+    const savedEnd = localStorage.getItem('cpa-team-custom-end') || '';
+    let start = null, end = now, label = 'Last 24 hours';
+    if (mode === '7d') { start = now - 7 * 86400000; label = 'Last 7 days'; }
+    else if (mode === '30d') { start = now - 30 * 86400000; label = 'Last 30 days'; }
+    else if (mode === 'all') { end = null; label = 'All time'; }
+    else if (mode === 'custom') { start = savedStart ? Date.parse(savedStart) : null; end = savedEnd ? Date.parse(savedEnd) : null; label = (savedStart || 'beginning') + ' → ' + (savedEnd || 'now'); }
+    else { start = now - 86400000; }
+    if (!Number.isFinite(start)) start = null;
+    if (!Number.isFinite(end)) end = null;
+    return { mode, start, end, savedStart, savedEnd, label };
+  }
+  function inRange(ts, range){ const t = parseTime(ts); if (t == null) return false; if (range.start != null && t < range.start) return false; if (range.end != null && t > range.end) return false; return true; }
+  function usageRows(resp, resolveLabel, range){
+    const root = usageRoot(resp);
+    const rows = [];
+    const apis = isObj(root) && isObj(root.apis) ? root.apis : null;
+    if (apis) {
+      Object.entries(apis).forEach(([apiId, api]) => {
+        const label = resolveLabel(apiId);
+        if (!label) return;
+        const models = isObj(api) && isObj(api.models) ? api.models : {};
+        Object.entries(models).forEach(([model, modelData]) => {
+          const details = arr(modelData && modelData.details);
+          if (details.length) {
+            details.forEach(d => {
+              if (!isObj(d) || !inRange(d.timestamp, range)) return;
+              const parts = tokenParts(d.tokens);
+              rows.push({ label, model: model || 'Unknown model', requests: 1, failed: d.failed === true, ...parts });
+            });
+          }
+        });
+      });
+      return rows;
+    }
+    const list = Array.isArray(root) ? root : [];
+    list.forEach((d, i) => {
+      if (!isObj(d) || !inRange(d.timestamp, range)) return;
+      const label = resolveLabel(d.api_key || d.apiKey || d.key || d.source, d.auth_index ?? d.authIndex ?? i);
+      if (!label) return;
+      const parts = tokenParts(d.tokens || d);
+      const model = d.model || d.model_name || d.modelName || d.__modelName || 'Unknown model';
+      rows.push({ label, model, requests: num(d.requests) || 1, failed: d.failed === true, ...parts });
+    });
+    return rows;
+  }
+  function aggregate(rows){
+    const labels = new Map();
+    const models = new Map();
+    const parts = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheCreate: 0, total: 0, requests: 0 };
+    rows.forEach(r => {
+      const label = safeLabel(r.label, 'Key');
+      const model = safeLabel(r.model, 'Unknown model');
+      if (!labels.has(label)) labels.set(label, { label, total: 0, requests: 0, failed: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheCreate: 0, models: new Map() });
+      const item = labels.get(label);
+      const total = num(r.total), requests = num(r.requests) || 1;
+      item.total += total; item.requests += requests; item.failed += r.failed ? 1 : 0;
+      ['input','output','reasoning','cacheRead','cacheCreate'].forEach(k => { item[k] += num(r[k]); parts[k] += num(r[k]); });
+      item.models.set(model, (item.models.get(model) || 0) + total);
+      models.set(model, (models.get(model) || 0) + total);
+      parts.total += total; parts.requests += requests;
+    });
+    const labelItems = Array.from(labels.values()).map(x => ({ ...x, models: Array.from(x.models.entries()).map(([model,total]) => ({model,total})).sort((a,b)=>b.total-a.total) })).sort((a,b)=>b.total-a.total);
+    const modelItems = Array.from(models.entries()).map(([model,total]) => ({model,total})).sort((a,b)=>b.total-a.total);
+    return { labels: labelItems, models: modelItems, parts };
+  }
+  function bars(items, total){
+    if (!items.length || !total) return '<div class="cpa-team-muted">No token data</div>';
+    return '<div class="cpa-team-bar">' + items.map((m, i) => '<span style="width:' + Math.max(1, m.total / total * 100) + '%;background:' + COLORS[i % COLORS.length] + '" title="' + esc(m.model) + ': ' + esc(fmt(m.total)) + ' tokens"></span>').join('') + '</div>';
+  }
+  function modelLegend(items, total){
+    return '<div class="cpa-team-legend">' + items.map((m, i) => '<span><b style="background:' + COLORS[i % COLORS.length] + '"></b>' + esc(m.model) + ' · ' + esc(fmt(m.total)) + ' · ' + esc(pct(total ? m.total / total * 100 : 0)) + '</span>').join('') + '</div>';
+  }
+  function renderData(data, range){
+    const topModel = data.models[0];
+    const rangeButtons = [['24h','Daily'],['7d','Weekly'],['30d','Monthly'],['all','All time'],['custom','Custom']].map(([mode,label]) => '<button class="cpa-team-range-btn' + (range.mode === mode ? ' active' : '') + '" data-range="' + esc(mode) + '" type="button">' + esc(label) + '</button>').join('');
+    const html = '<div class="cpa-team-shell">'
+      + '<div class="cpa-team-head"><div><p class="cpa-team-eyebrow">CPA Management</p><h1>Team</h1><p>Usage by API key label and model for the selected period. Raw API keys are intentionally hidden.</p></div><button id="cpa-team-refresh" type="button">Refresh</button></div>'
+      + '<section class="cpa-team-panel cpa-team-filters"><div><div class="cpa-team-range-buttons">' + rangeButtons + '</div><p>Showing: <strong>' + esc(range.label) + '</strong></p></div><div class="cpa-team-custom"><label>Start<input id="cpa-team-start" type="datetime-local" value="' + esc(range.savedStart || (range.start != null ? toLocalInput(range.start) : '')) + '"></label><label>End<input id="cpa-team-end" type="datetime-local" value="' + esc(range.savedEnd || (range.end != null ? toLocalInput(range.end) : '')) + '"></label><button id="cpa-team-apply-custom" type="button">Apply</button></div></section>'
+      + '<div class="cpa-team-cards"><div><span>API key labels</span><strong>' + esc(fmt(data.labels.length)) + '</strong></div><div><span>Total tokens</span><strong>' + esc(fmt(data.parts.total)) + '</strong></div><div><span>Requests</span><strong>' + esc(fmt(data.parts.requests)) + '</strong></div><div><span>Top model</span><strong>' + esc(topModel ? topModel.model : '—') + '</strong></div></div>'
+      + '<section class="cpa-team-panel"><div class="cpa-team-section-title"><h2>Model composition</h2><span>' + esc(new Date().toLocaleString()) + '</span></div>' + bars(data.models, data.parts.total) + modelLegend(data.models, data.parts.total) + '</section>'
+      + '<section class="cpa-team-panel"><div class="cpa-team-section-title"><h2>Usage by key label</h2><span>' + esc(fmt(data.labels.length)) + ' labels</span></div>'
+      + '<div class="cpa-team-table"><table><thead><tr><th>Label</th><th>Total tokens</th><th>Requests</th><th>Top model</th><th>Composition</th></tr></thead><tbody>'
+      + data.labels.map((k, idx) => '<tr><td><strong>' + esc(k.label) + '</strong></td><td>' + esc(fmt(k.total)) + '</td><td>' + esc(fmt(k.requests)) + '</td><td>' + esc(k.models[0] ? k.models[0].model : '—') + '</td><td>' + bars(k.models, k.total) + modelLegend(k.models.slice(0,6), k.total) + '</td></tr>').join('')
+      + (data.labels.length ? '' : '<tr><td colspan="5" class="cpa-team-empty">No usage rows with API-key attribution were found.</td></tr>')
+      + '</tbody></table></div></section>'
+      + '<section class="cpa-team-panel"><div class="cpa-team-section-title"><h2>Token type composition</h2></div><div class="cpa-team-parts">'
+      + ['input','output','reasoning','cacheRead','cacheCreate'].map(k => '<div><span>' + esc(({input:'Input',output:'Output',reasoning:'Reasoning',cacheRead:'Cache read / cached',cacheCreate:'Cache creation'})[k]) + '</span><strong>' + esc(fmt(data.parts[k])) + '</strong></div>').join('')
+      + '</div></section></div>';
+    return html.replace(/sk-[A-Za-z0-9_-]{6,}/g, '[hidden-key]');
+  }
+  function bindControls(){
+    document.querySelectorAll('.cpa-team-range-btn').forEach(btn => btn.addEventListener('click', () => { const mode = btn.getAttribute('data-range') || '24h'; TEAM.rangeMode = mode; localStorage.setItem('cpa-team-range-mode', mode); render(); }, { once: true }));
+    const apply = document.getElementById('cpa-team-apply-custom');
+    if (apply) apply.addEventListener('click', () => { const start = document.getElementById('cpa-team-start'); const end = document.getElementById('cpa-team-end'); localStorage.setItem('cpa-team-custom-start', start ? start.value : ''); localStorage.setItem('cpa-team-custom-end', end ? end.value : ''); TEAM.rangeMode = 'custom'; localStorage.setItem('cpa-team-range-mode', 'custom'); render(); }, { once: true });
+  }
+  function style(){
+    if (document.getElementById('cpa-team-style')) return;
+    const el = document.createElement('style');
+    el.id = 'cpa-team-style';
+    el.textContent = '#cpa-team-root{min-height:auto;background:transparent;color:var(--text-primary,#171717);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.cpa-team-shell{max-width:none;margin:0;padding:0 0 56px}.cpa-team-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:24px}.cpa-team-head h1{font-size:42px;line-height:1;margin:4px 0 8px;letter-spacing:-.03em}.cpa-team-head p{margin:0;color:var(--text-secondary,#666);font-size:15px}.cpa-team-eyebrow{text-transform:uppercase;font-size:12px!important;letter-spacing:.14em;color:var(--primary-color,#c65746)!important;font-weight:700}.cpa-team-head button,.cpa-team-range-btn,.cpa-team-custom button{border:1px solid var(--border-color,#ddd);background:var(--bg-secondary,#fff);border-radius:999px;padding:10px 16px;color:inherit;cursor:pointer}.cpa-team-range-btn.active{background:var(--primary-color,#c65746);border-color:var(--primary-color,#c65746);color:#fff}.cpa-team-filters{display:flex;justify-content:space-between;gap:16px;align-items:flex-end}.cpa-team-filters p{margin:10px 0 0;color:var(--text-secondary,#666);font-size:13px}.cpa-team-range-buttons{display:flex;flex-wrap:wrap;gap:8px}.cpa-team-custom{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}.cpa-team-custom label{display:flex;flex-direction:column;gap:5px;color:var(--text-secondary,#666);font-size:12px}.cpa-team-custom input{border:1px solid var(--border-color,#ddd);background:var(--bg-secondary,#fff);border-radius:10px;padding:9px 10px;color:inherit}.cpa-team-cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.cpa-team-cards>div,.cpa-team-panel{background:var(--bg-secondary,#fff);border:1px solid var(--border-color,#e5e1dc);border-radius:18px;box-shadow:0 10px 30px rgba(15,23,42,.05)}.cpa-team-cards>div{padding:18px}.cpa-team-cards span,.cpa-team-muted{display:block;color:var(--text-secondary,#74716d);font-size:12px}.cpa-team-cards strong{display:block;font-size:24px;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cpa-team-panel{padding:20px;margin-top:18px}.cpa-team-section-title{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:16px}.cpa-team-section-title h2{font-size:18px;margin:0}.cpa-team-section-title span{font-size:12px;color:var(--text-secondary,#74716d)}.cpa-team-bar{display:flex;width:100%;height:16px;overflow:hidden;border-radius:999px;background:var(--bg-hover,#ece8e2);border:1px solid rgba(0,0,0,.04)}.cpa-team-bar span{display:block;height:100%;min-width:2px}.cpa-team-legend{display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:10px;font-size:12px;color:var(--text-secondary,#666)}.cpa-team-legend span{display:inline-flex;align-items:center;gap:6px}.cpa-team-legend b{width:9px;height:9px;border-radius:50%;display:inline-block}.cpa-team-table{overflow:auto}.cpa-team-table table{width:100%;border-collapse:collapse}.cpa-team-table th{text-align:left;font-size:12px;color:var(--text-secondary,#666);font-weight:600;padding:10px;border-bottom:1px solid var(--border-color,#e5e1dc)}.cpa-team-table td{vertical-align:top;padding:14px 10px;border-bottom:1px solid var(--border-color,#eee);font-size:14px}.cpa-team-empty{text-align:center;color:var(--text-secondary,#666);padding:28px!important}.cpa-team-parts{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}.cpa-team-parts div{padding:14px;border-radius:14px;background:var(--bg-primary,#f8f7f4)}.cpa-team-parts span{display:block;color:var(--text-secondary,#666);font-size:12px}.cpa-team-parts strong{display:block;margin-top:6px;font-size:18px}.cpa-team-error{max-width:760px;margin:0;padding:24px;border-radius:18px;border:1px solid #f1b4a9;background:#fff7f5;color:#7c2d12}.cpa-team-error h1{margin:0 0 8px}.cpa-team-error code{word-break:break-word}@media(max-width:850px){.cpa-team-cards,.cpa-team-parts{grid-template-columns:repeat(2,minmax(0,1fr))}.cpa-team-head{flex-direction:column}.cpa-team-head h1{font-size:34px}}@media(max-width:560px){.cpa-team-cards,.cpa-team-parts{grid-template-columns:1fr}.cpa-team-shell{padding-bottom:24px}}';
+    document.head.appendChild(el);
+  }
+  function contentHost(){ return document.querySelector('.main-content .page-transition__layer') || document.querySelector('main.main-content') || document.querySelector('.content') || document.body; }
+  function root(){
+    let el = document.getElementById('cpa-team-root');
+    if (!el) { el = document.createElement('div'); el.id = 'cpa-team-root'; }
+    const host = contentHost();
+    if (el.parentElement !== host) host.appendChild(el);
+    return el;
+  }
+  function isTeam(){ return TEAM.active === true || (location.hash || '').replace(/\/+$/,'') === '#/team'; }
+  function setTeamActive(active){ TEAM.active = !!active; }
+  function setMainVisible(visible){
+    const host = contentHost();
+    Array.from(host.children).forEach(child => { if (child.id !== 'cpa-team-root') child.style.display = visible ? '' : 'none'; });
+  }
+  function updateNavActive(){
+    const team = document.querySelector('[data-cpa-team-nav="true"], a[href="#/team"]');
+    if (!team) return;
+    if (isTeam()) {
+      document.querySelectorAll('.sidebar .nav-item.active, .sidebar a.active').forEach(n => { if (n !== team) n.classList.remove('active'); });
+      team.classList.add('active');
+      team.setAttribute('aria-current', 'page');
+    } else {
+      team.classList.remove('active');
+      team.removeAttribute('aria-current');
+    }
+  }
+  async function render(){
+    style();
+    const el = root();
+    updateNavActive();
+    if (!isTeam()) { el.style.display = 'none'; setMainVisible(true); return; }
+    setMainVisible(false); el.style.display = 'block';
+    el.innerHTML = '<div class="cpa-team-shell"><div class="cpa-team-panel">Loading team usage…</div></div>';
+    try {
+      const [usage, cfg] = await Promise.all([apiGet('/usage'), apiGet('/api-key-configs')]);
+      const resolver = buildResolver(configList(cfg));
+      const range = rangeState();
+      const data = aggregate(usageRows(usage, resolver, range));
+      el.innerHTML = renderData(data, range);
+      bindControls();
+      const btn = document.getElementById('cpa-team-refresh');
+      if (btn) btn.addEventListener('click', render, { once: true });
+    } catch (err) {
+      el.innerHTML = '<div class="cpa-team-error"><h1>Team usage unavailable</h1><p>Log in to the management center, then reopen the Team page. Existing pages are unchanged.</p><code>' + esc(err && err.message ? err.message : err) + '</code></div>';
+    }
+  }
+  function ensureNav(){
+    if (document.querySelector('[data-cpa-team-nav="true"], a[href="#/team"]')) return;
+    const usage = document.querySelector('a[href="#/usage"]');
+    const nav = usage && usage.parentElement;
+    if (!nav) return;
+    const clone = usage.cloneNode(true);
+    clone.setAttribute('href', '#/team');
+    clone.setAttribute('data-cpa-team-nav', 'true');
+    clone.addEventListener('click', ev => { ev.preventDefault(); setTeamActive(true); history.replaceState(null, '', '#/team'); updateNavActive(); render(); });
+    clone.querySelectorAll('*').forEach(n => { if (n.childNodes.length === 1 && n.firstChild.nodeType === 3 && /usage|使用|стат/i.test(n.textContent || '')) n.textContent = 'Team'; });
+    if ((clone.textContent || '').trim() === (usage.textContent || '').trim()) clone.appendChild(document.createTextNode(' Team'));
+    usage.insertAdjacentElement('afterend', clone);
+  }
+  document.addEventListener('click', ev => { const a = ev.target && ev.target.closest && ev.target.closest('a[href^="#/"]'); if (a && a.getAttribute('href') !== '#/team') setTeamActive(false); }, true);
+  window.addEventListener('hashchange', render);
+  window.addEventListener('storage', render);
+  window.addEventListener('DOMContentLoaded', () => { render(); setTimeout(ensureNav, 500); });
+  window.addEventListener('load', () => { render(); ensureNav(); });
+  new MutationObserver(() => ensureNav()).observe(document.documentElement, { childList: true, subtree: true });
+  setTimeout(() => { render(); ensureNav(); }, 1200);
+})();
+</script>
+
+</body>
 </html>
