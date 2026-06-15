@@ -17,8 +17,36 @@ import (
 
 var statisticsEnabled atomic.Bool
 
+// maxDetailsPerModel bounds how many per-request details are retained per
+// (api_key, model). Older entries are dropped once the cap is exceeded so the
+// in-memory store cannot grow without bound. Aggregated counters
+// (TotalRequests/TotalTokens and the hourly aggregator buckets) are unaffected;
+// only the raw per-request history (used by the dashboard's fine-grained charts)
+// is trimmed to the most recent entries.
+var maxDetailsPerModel atomic.Int64
+
+const defaultMaxDetailsPerModel = 50000
+
+// SetMaxDetailsPerModel overrides the per-(api_key, model) detail retention cap.
+// Values <= 0 restore the default. Existing over-cap slices are trimmed lazily
+// on the next Record call.
+func SetMaxDetailsPerModel(n int) {
+	if n <= 0 {
+		n = defaultMaxDetailsPerModel
+	}
+	maxDetailsPerModel.Store(int64(n))
+}
+
+func detailsCap() int {
+	if v := maxDetailsPerModel.Load(); v > 0 {
+		return int(v)
+	}
+	return defaultMaxDetailsPerModel
+}
+
 func init() {
 	statisticsEnabled.Store(true)
+	maxDetailsPerModel.Store(defaultMaxDetailsPerModel)
 	coreusage.RegisterPlugin(NewLoggerPlugin())
 }
 
@@ -81,9 +109,17 @@ type apiStats struct {
 }
 
 // modelStats holds aggregated metrics for a specific model within an API.
+//
+// Details is a sliding window: it retains only the most recent maxDetailsPerModel
+// entries to bound memory. detailsBase is the absolute number of details already
+// dropped from the front, so detailsBase+len(Details) equals the total number of
+// details ever recorded. Consumers that track progress by absolute index (the
+// aggregator cursor) use detailsBase to map an absolute position back into the
+// retained slice.
 type modelStats struct {
 	TotalRequests int64
 	TotalTokens   int64
+	DetailsBase   int64
 	Details       []RequestDetail
 }
 
@@ -222,7 +258,20 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	}
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
-	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+	modelStatsValue.appendDetail(detail)
+}
+
+// appendDetail appends a detail and enforces the retention cap, dropping the
+// oldest entries and advancing DetailsBase so absolute indexing stays correct.
+func (m *modelStats) appendDetail(detail RequestDetail) {
+	m.Details = append(m.Details, detail)
+	limit := detailsCap()
+	if len(m.Details) <= limit {
+		return
+	}
+	drop := len(m.Details) - limit
+	m.Details = append(m.Details[:0], m.Details[drop:]...)
+	m.DetailsBase += int64(drop)
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.

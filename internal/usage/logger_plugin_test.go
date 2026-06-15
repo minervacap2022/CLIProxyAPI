@@ -94,3 +94,36 @@ func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 		t.Fatalf("details len = %d, want 1", len(details))
 	}
 }
+
+func TestRequestStatisticsDetailsRingBufferCap(t *testing.T) {
+	prev := int(maxDetailsPerModel.Load())
+	SetMaxDetailsPerModel(5)
+	defer SetMaxDetailsPerModel(prev)
+
+	stats := NewRequestStatistics()
+	base := time.Now()
+	for i := 0; i < 12; i++ {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "k",
+			Model:       "m",
+			RequestedAt: base.Add(time.Duration(i) * time.Second),
+			Detail:      coreusage.Detail{TotalTokens: int64(i + 1)},
+		})
+	}
+
+	ms := stats.apis["k"].Models["m"]
+	if len(ms.Details) != 5 {
+		t.Fatalf("retained details = %d, want 5", len(ms.Details))
+	}
+	if ms.DetailsBase != 7 {
+		t.Fatalf("DetailsBase = %d, want 7", ms.DetailsBase)
+	}
+	// Aggregated counters must reflect all 12 requests, not just retained ones.
+	if ms.TotalRequests != 12 {
+		t.Fatalf("TotalRequests = %d, want 12", ms.TotalRequests)
+	}
+	// Retained window must be the newest entries (tokens 8..12).
+	if ms.Details[0].Tokens.TotalTokens != 8 || ms.Details[4].Tokens.TotalTokens != 12 {
+		t.Fatalf("retained window wrong: first=%d last=%d", ms.Details[0].Tokens.TotalTokens, ms.Details[4].Tokens.TotalTokens)
+	}
+}

@@ -164,3 +164,49 @@ func TestAggregatorRedisRoundTrip(t *testing.T) {
 		t.Fatalf("redis round trip wrong: %+v", rows)
 	}
 }
+
+func TestAggregatorFoldSurvivesDetailEviction(t *testing.T) {
+	prev := int(maxDetailsPerModel.Load())
+	SetMaxDetailsPerModel(5)
+	defer SetMaxDetailsPerModel(prev)
+
+	stats := NewRequestStatistics()
+	now := time.Now()
+	rec := func(tok int64) {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "k",
+			Model:       "m",
+			RequestedAt: now,
+			Detail:      coreusage.Detail{TotalTokens: tok},
+		})
+	}
+
+	agg := newTestAggregator(stats)
+
+	// First 3 requests, fold them.
+	rec(1)
+	rec(1)
+	rec(1)
+	agg.fold()
+	if got := agg.Summary(time.Time{}, time.Time{}); got[0].Requests != 3 || got[0].TotalTokens != 3 {
+		t.Fatalf("after first fold: %+v", got)
+	}
+
+	// 4 more requests push total to 7, evicting the 2 oldest (cap=5). The
+	// evicted ones were already folded, so no data is lost.
+	rec(1)
+	rec(1)
+	rec(1)
+	rec(1)
+	agg.fold()
+	got := agg.Summary(time.Time{}, time.Time{})
+	if got[0].Requests != 7 || got[0].TotalTokens != 7 {
+		t.Fatalf("after eviction fold: requests=%d tokens=%d, want 7/7", got[0].Requests, got[0].TotalTokens)
+	}
+
+	// No new requests: fold must be a no-op (no double counting).
+	agg.fold()
+	if got := agg.Summary(time.Time{}, time.Time{}); got[0].Requests != 7 {
+		t.Fatalf("re-fold double counted: %+v", got)
+	}
+}

@@ -249,14 +249,25 @@ func (a *Aggregator) fold() map[bucketKey]struct{} {
 				continue
 			}
 			cursorKey := apiName + aggFieldSep + modelName
-			processed := a.cursor[cursorKey]
+			// processed is the absolute number of details already folded for this
+			// (api, model). base is how many were dropped from the front of the
+			// retained slice, so absolute index i maps to Details[i-base].
+			processed := int64(a.cursor[cursorKey])
 			details := modelStatsValue.Details
-			if processed >= len(details) {
+			base := modelStatsValue.DetailsBase
+			total := base + int64(len(details))
+			if processed >= total {
 				continue
 			}
+			// If the cursor fell behind the retained window (details were dropped
+			// before being folded), resume from the oldest retained entry.
+			start := processed
+			if start < base {
+				start = base
+			}
 			perHour := make(map[int64]*aggBucket)
-			for i := processed; i < len(details); i++ {
-				d := &details[i]
+			for i := start; i < total; i++ {
+				d := &details[i-base]
 				hour := d.Timestamp.Unix() / secondsPerHour
 				b := perHour[hour]
 				if b == nil {
@@ -276,7 +287,7 @@ func (a *Aggregator) fold() map[bucketKey]struct{} {
 			for hour, b := range perHour {
 				updates = append(updates, pending{key: bucketKey{api: apiName, model: modelName, hour: hour}, bucket: *b})
 			}
-			cursorUpdates[cursorKey] = len(details)
+			cursorUpdates[cursorKey] = int(total)
 		}
 	}
 	a.stats.mu.RUnlock()
