@@ -14,6 +14,8 @@ package management
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,6 +31,41 @@ type usageExportPayload struct {
 type usageImportPayload struct {
 	Version int                      `json:"version"`
 	Usage   usage.StatisticsSnapshot `json:"usage"`
+}
+
+// GetUsageSummary returns api_key × model aggregated usage rows for the optional
+// [start, end] window (RFC3339 or unix-millis query params). This powers the
+// management panel Team view without shipping every per-request detail to the
+// browser.
+func (h *Handler) GetUsageSummary(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusOK, gin.H{"rows": []usage.SummaryRow{}})
+		return
+	}
+	start := parseUsageTime(c.Query("start"))
+	end := parseUsageTime(c.Query("end"))
+	if agg := usage.DefaultAggregator(); agg != nil {
+		c.JSON(http.StatusOK, gin.H{"rows": agg.Summary(start, end), "source": "aggregator"})
+		return
+	}
+	rows := h.usageStats.SummaryRows(start, end)
+	c.JSON(http.StatusOK, gin.H{"rows": rows, "source": "memory"})
+}
+
+// parseUsageTime parses a query value as RFC3339 or unix milliseconds. An empty
+// or unparseable value yields the zero time (treated as unbounded).
+func parseUsageTime(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t
+	}
+	if ms, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return time.UnixMilli(ms)
+	}
+	return time.Time{}
 }
 
 // GetUsageStatistics returns the in-memory request statistics snapshot.

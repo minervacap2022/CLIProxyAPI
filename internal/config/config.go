@@ -173,7 +173,30 @@ type Config struct {
 	// upstream v6 behaviour). Klik-specific.
 	UsagePersistence UsagePersistenceConfig `yaml:"usage-persistence,omitempty" json:"usage-persistence,omitempty"`
 
+	// UsageAggregation configures the optional Redis-backed hourly usage
+	// aggregator that powers the management panel Team view. When Addr is
+	// empty the Team view falls back to walking in-memory details. Klik-specific.
+	UsageAggregation UsageAggregationConfig `yaml:"usage-aggregation,omitempty" json:"usage-aggregation,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// UsageAggregationConfig drives internal/usage.Aggregator.
+type UsageAggregationConfig struct {
+	// Addr is the Redis endpoint, e.g. "127.0.0.1:6379". Empty disables
+	// aggregation (Team view falls back to in-memory detail walking).
+	Addr string `yaml:"addr,omitempty" json:"addr,omitempty"`
+	// Password is the Redis AUTH password (optional).
+	Password string `yaml:"password,omitempty" json:"password,omitempty"`
+	// DB is the Redis logical database index. Default 0.
+	DB int `yaml:"db,omitempty" json:"db,omitempty"`
+	// Key is the Redis hash storing hourly buckets. Default "cpa:usage:agg".
+	Key string `yaml:"key,omitempty" json:"key,omitempty"`
+	// IntervalSeconds controls how often details are folded into buckets.
+	// Default 300 (5 minutes).
+	IntervalSeconds int `yaml:"interval-seconds,omitempty" json:"interval-seconds,omitempty"`
+	// RetentionDays prunes buckets older than N days. Zero keeps all buckets.
+	RetentionDays int `yaml:"retention-days,omitempty" json:"retention-days,omitempty"`
 }
 
 // UsagePersistenceConfig drives internal/usage.Persistor.

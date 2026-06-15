@@ -119,6 +119,11 @@ type Service struct {
 	// to Redis on a schedule. Nil when redis is not configured / unreachable
 	// (the stats keep running in pure in-memory mode in that case).
 	usagePersistor *internalusage.Persistor
+
+	// usageAggregator optionally folds usage details into hourly buckets in
+	// Redis to power the management Team view. Nil when redis is not configured
+	// / unreachable.
+	usageAggregator *internalusage.Aggregator
 }
 
 // warmupAdapter bridges the management-handler WarmupController interface and
@@ -849,6 +854,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	usage.StartDefault(ctx)
 	s.startUsagePersistor(ctx)
+	s.startUsageAggregator(ctx)
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)
@@ -1144,6 +1150,11 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			s.usagePersistor.Stop()
 			s.usagePersistor = nil
 		}
+		if s.usageAggregator != nil {
+			s.usageAggregator.Stop()
+			s.usageAggregator = nil
+			internalusage.SetDefaultAggregator(nil)
+		}
 	})
 	return shutdownErr
 }
@@ -1185,6 +1196,47 @@ func (s *Service) startUsagePersistor(ctx context.Context) {
 	persistor.Start(ctx)
 	s.usagePersistor = persistor
 	log.Infof("usage persistence: enabled (addr=%s db=%d key=%s flush=%s)", opts.Addr, opts.DB, opts.Key, opts.FlushInterval)
+}
+
+// startUsageAggregator wires the in-memory usage stats to a Redis-backed hourly
+// aggregator that powers the management Team view. On failure we log and
+// continue; the Team view falls back to walking in-memory details.
+func (s *Service) startUsageAggregator(ctx context.Context) {
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	if cfg == nil || cfg.UsageAggregation.Addr == "" {
+		return
+	}
+	stats := internalusage.GetRequestStatistics()
+	if stats == nil {
+		log.Warn("usage aggregation: in-memory stats unavailable; skipping aggregator")
+		return
+	}
+	opts := internalusage.AggregatorOptions{
+		Addr:          cfg.UsageAggregation.Addr,
+		Password:      cfg.UsageAggregation.Password,
+		DB:            cfg.UsageAggregation.DB,
+		Key:           cfg.UsageAggregation.Key,
+		RetentionDays: cfg.UsageAggregation.RetentionDays,
+	}
+	if cfg.UsageAggregation.IntervalSeconds > 0 {
+		opts.Interval = time.Duration(cfg.UsageAggregation.IntervalSeconds) * time.Second
+	}
+	aggregator, err := internalusage.NewAggregator(opts, stats)
+	if err != nil {
+		log.WithError(err).Error("usage aggregation: redis unavailable; Team view will fall back to in-memory aggregation")
+		return
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := aggregator.Load(loadCtx); err != nil {
+		log.WithError(err).Warn("usage aggregation: state load failed; starting fresh")
+	}
+	aggregator.Start(ctx)
+	s.usageAggregator = aggregator
+	internalusage.SetDefaultAggregator(aggregator)
+	log.Infof("usage aggregation: enabled (addr=%s db=%d key=%s interval=%s)", opts.Addr, opts.DB, opts.Key, opts.Interval)
 }
 
 func (s *Service) ensureAuthDir() error {

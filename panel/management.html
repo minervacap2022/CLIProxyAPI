@@ -308,8 +308,6 @@ ${i.comment}`:i.comment}this.doc.range[2]=i.offset;break}default:this.errors.pus
     const total = totalGiven || input + output + reasoning + Math.max(cached, cacheRead + cacheCreate);
     return { input, output, reasoning, cacheRead, cacheCreate, total };
   }
-  function usageRoot(resp){ return resp && (resp.usage || resp.data || resp); }
-  function parseTime(value){ const t = Date.parse(String(value || '')); return Number.isFinite(t) ? t : null; }
   function pad2(n){ return String(n).padStart(2, '0'); }
   function toLocalInput(ms){ const d = new Date(ms); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
   function rangeState(){
@@ -327,37 +325,21 @@ ${i.comment}`:i.comment}this.doc.range[2]=i.offset;break}default:this.errors.pus
     if (!Number.isFinite(end)) end = null;
     return { mode, start, end, savedStart, savedEnd, label };
   }
-  function inRange(ts, range){ const t = parseTime(ts); if (t == null) return false; if (range.start != null && t < range.start) return false; if (range.end != null && t > range.end) return false; return true; }
-  function usageRows(resp, resolveLabel, range){
-    const root = usageRoot(resp);
+  function summaryRows(resp, resolveLabel){
+    const list = arr(resp && (resp.rows || resp.data || resp));
     const rows = [];
-    const apis = isObj(root) && isObj(root.apis) ? root.apis : null;
-    if (apis) {
-      Object.entries(apis).forEach(([apiId, api]) => {
-        const label = resolveLabel(apiId);
-        if (!label) return;
-        const models = isObj(api) && isObj(api.models) ? api.models : {};
-        Object.entries(models).forEach(([model, modelData]) => {
-          const details = arr(modelData && modelData.details);
-          if (details.length) {
-            details.forEach(d => {
-              if (!isObj(d) || !inRange(d.timestamp, range)) return;
-              const parts = tokenParts(d.tokens);
-              rows.push({ label, model: model || 'Unknown model', requests: 1, failed: d.failed === true, ...parts });
-            });
-          }
-        });
-      });
-      return rows;
-    }
-    const list = Array.isArray(root) ? root : [];
-    list.forEach((d, i) => {
-      if (!isObj(d) || !inRange(d.timestamp, range)) return;
-      const label = resolveLabel(d.api_key || d.apiKey || d.key || d.source, d.auth_index ?? d.authIndex ?? i);
+    list.forEach(r => {
+      if (!isObj(r)) return;
+      const label = resolveLabel(r.api_key || r.apiKey || r.key);
       if (!label) return;
-      const parts = tokenParts(d.tokens || d);
-      const model = d.model || d.model_name || d.modelName || d.__modelName || 'Unknown model';
-      rows.push({ label, model, requests: num(d.requests) || 1, failed: d.failed === true, ...parts });
+      const parts = tokenParts(r);
+      rows.push({
+        label,
+        model: r.model || 'Unknown model',
+        requests: num(r.requests),
+        failed: num(r.failed),
+        ...parts,
+      });
     });
     return rows;
   }
@@ -371,7 +353,8 @@ ${i.comment}`:i.comment}this.doc.range[2]=i.offset;break}default:this.errors.pus
       if (!labels.has(label)) labels.set(label, { label, total: 0, requests: 0, failed: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheCreate: 0, models: new Map() });
       const item = labels.get(label);
       const total = num(r.total), requests = num(r.requests) || 1;
-      item.total += total; item.requests += requests; item.failed += r.failed ? 1 : 0;
+      const failed = num(r.failed) || (r.failed === true ? 1 : 0);
+      item.total += total; item.requests += requests; item.failed += failed;
       ['input','output','reasoning','cacheRead','cacheCreate'].forEach(k => { item[k] += num(r[k]); parts[k] += num(r[k]); });
       item.models.set(model, (item.models.get(model) || 0) + total);
       models.set(model, (models.get(model) || 0) + total);
@@ -452,10 +435,14 @@ ${i.comment}`:i.comment}this.doc.range[2]=i.offset;break}default:this.errors.pus
     setMainVisible(false); el.style.display = 'block';
     el.innerHTML = '<div class="cpa-team-shell"><div class="cpa-team-panel">Loading team usage…</div></div>';
     try {
-      const [usage, cfg] = await Promise.all([apiGet('/usage'), apiGet('/api-key-configs')]);
-      const resolver = buildResolver(configList(cfg));
       const range = rangeState();
-      const data = aggregate(usageRows(usage, resolver, range));
+      const qs = [];
+      if (range.start != null) qs.push('start=' + encodeURIComponent(new Date(range.start).toISOString()));
+      if (range.end != null) qs.push('end=' + encodeURIComponent(new Date(range.end).toISOString()));
+      const summaryPath = '/usage/summary' + (qs.length ? '?' + qs.join('&') : '');
+      const [summary, cfg] = await Promise.all([apiGet(summaryPath), apiGet('/api-key-configs')]);
+      const resolver = buildResolver(configList(cfg));
+      const data = aggregate(summaryRows(summary, resolver));
       el.innerHTML = renderData(data, range);
       bindControls();
       const btn = document.getElementById('cpa-team-refresh');

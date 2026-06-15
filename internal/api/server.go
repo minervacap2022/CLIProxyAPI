@@ -610,6 +610,7 @@ func (s *Server) registerManagementRoutes() {
 		// the upstream removal in commit 18bb9c31). The /usage-queue endpoint
 		// remains the new Redis-queue consumer entry point.
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage/summary", s.mgmt.GetUsageSummary)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 
