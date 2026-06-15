@@ -21,8 +21,10 @@ func TestParseDoubaoRetryAfter(t *testing.T) {
 		t.Errorf("expected ~10d duration, got %v", *d)
 	}
 
-	// Exact body from real 429 response
-	realBody := []byte(`{"error":{"code":"AccountQuotaExceeded","message":"You have exceeded the monthly usage quota. It will reset at 2026-04-23 23:59:59 +0800 CST. We recommend upgrading your plan for more quota, or waiting for the reset.","param":"","type":"TooManyRequests"}}`)
+	// Exact body shape from a real 429 response, with a future reset timestamp
+	// (relative so the test does not expire as wall-clock time advances).
+	realReset := future.In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05 +0800 CST")
+	realBody := []byte(fmt.Sprintf(`{"error":{"code":"AccountQuotaExceeded","message":"You have exceeded the monthly usage quota. It will reset at %s. We recommend upgrading your plan for more quota, or waiting for the reset.","param":"","type":"TooManyRequests"}}`, realReset))
 	d2 := parseDoubaoRetryAfter(realBody)
 	if d2 == nil {
 		t.Fatal("expected non-nil duration for real 429 body")

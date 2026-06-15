@@ -16,6 +16,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -36,18 +38,25 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                 *config.Config
-	configFilePath      string
-	mu                  sync.Mutex
-	attemptsMu          sync.Mutex
-	failedAttempts      map[string]*attemptInfo // keyed by client IP
-	authManager         *coreauth.Manager
-	tokenStore          coreauth.Store
-	localPassword       string
-	allowRemoteOverride bool
-	envSecret           string
-	logDir              string
-	postAuthHook        coreauth.PostAuthHook
+	cfg                    *config.Config
+	configFilePath         string
+	mu                     sync.Mutex
+	attemptsMu             sync.Mutex
+	failedAttempts         map[string]*attemptInfo // keyed by client IP
+	authManager            *coreauth.Manager
+	tokenStore             coreauth.Store
+	localPassword          string
+	allowRemoteOverride    bool
+	envSecret              string
+	logDir                 string
+	postAuthHook           coreauth.PostAuthHook
+	postAuthPersistHook    coreauth.PostAuthHook
+	pluginHost             *pluginhost.Host
+	configReloadHook       func(context.Context, *config.Config)
+	pluginStoreRegistryURL string
+	pluginStoreHTTPClient  pluginstore.HTTPDoer
+	pluginReleaseCacheMu   sync.Mutex
+	pluginReleaseCache     map[string]pluginReleaseCacheEntry
 	/*
 	 * keyConfigRefreshFunc is called whenever api-key-configs or model-groups change
 	 * so the server can immediately rebuild its in-memory lookup indexes.
@@ -153,6 +162,43 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Unlock()
 }
 
+// SetPluginHost updates the plugin host used by plugin-backed management endpoints.
+func (h *Handler) SetPluginHost(host *pluginhost.Host) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.pluginHost = host
+	h.mu.Unlock()
+}
+
+// SetConfigReloadHook updates the callback used after management saves config changes.
+func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.configReloadHook = hook
+	h.mu.Unlock()
+}
+
+func (h *Handler) reloadConfigAfterManagementSave(ctx context.Context, cfg *config.Config) {
+	if h == nil || cfg == nil {
+		return
+	}
+	h.mu.Lock()
+	hook := h.configReloadHook
+	host := h.pluginHost
+	h.mu.Unlock()
+	if hook != nil {
+		hook(ctx, cfg)
+		return
+	}
+	if host != nil {
+		host.ApplyConfig(ctx, cfg)
+	}
+}
+
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
 
@@ -181,9 +227,6 @@ func (h *Handler) SetKeyConfigRefreshFunc(f func()) {
 	h.keyConfigRefreshFunc = f
 }
 
-// SetWarmupController wires the warmup scheduler into the management handler
-// so operators can trigger rounds and reload the scheduler after config edits.
-// Passing nil clears the controller (warmup endpoints will return 503).
 // SetUsageStatistics injects the in-memory usage statistics store used by the
 // legacy /usage, /usage/export, /usage/import endpoints. Safe to call with nil
 // to disable those endpoints' data path.
@@ -194,10 +237,18 @@ func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) {
 	h.usageStats = stats
 }
 
+// SetWarmupController wires the warmup scheduler into the management handler
+// so operators can trigger rounds and reload the scheduler after config edits.
+// Passing nil clears the controller (warmup endpoints will return 503).
 func (h *Handler) SetWarmupController(ctrl WarmupController) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.warmupController = ctrl
+}
+
+// SetPostAuthPersistHook registers a hook to be called after auth persistence.
+func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
+	h.postAuthPersistHook = hook
 }
 
 // Middleware enforces access control for management endpoints.
@@ -208,6 +259,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		c.Header("X-CPA-VERSION", buildinfo.Version)
 		c.Header("X-CPA-COMMIT", buildinfo.Commit)
 		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
+		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"

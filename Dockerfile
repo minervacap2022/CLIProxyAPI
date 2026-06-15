@@ -1,6 +1,8 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26-bookworm AS builder
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git && rm -rf /var/lib/apt/lists/*
 
 COPY go.mod go.sum ./
 
@@ -15,15 +17,15 @@ ARG TARGETARCH
 ARG TARGETOS=linux
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w \
+    go build -buildvcs=false -ldflags="-s -w \
       -X 'main.Version=${VERSION}' \
       -X 'main.Commit=${COMMIT}' \
       -X 'main.BuildDate=${BUILD_DATE}'" \
     -o ./CLIProxyAPI ./cmd/server/
 
-FROM alpine:3.23
+FROM debian:bookworm
 
-RUN apk add --no-cache tzdata ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /CLIProxyAPI/panel
 

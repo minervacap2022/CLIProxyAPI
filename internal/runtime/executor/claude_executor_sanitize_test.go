@@ -2,11 +2,14 @@ package executor
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -108,8 +111,11 @@ func TestClaudeExecutor_PreservesSignedThinkingBlocks(t *testing.T) {
 		"base_url": server.URL,
 	}}
 
-	// A signature long enough to satisfy any minimum-length check elsewhere.
-	validSig := strings.Repeat("a", 128)
+	// A genuine Anthropic provider-native thinking signature. Upstream's stricter
+	// signature sanitizer only preserves blocks whose signature is detected as
+	// Claude-native; it may normalize the encoding, so we assert the block and a
+	// signature survive rather than matching exact bytes.
+	validSig := validClaudeThinkingSignature()
 	payload := []byte(`{
 		"model":"claude-3-5-sonnet",
 		"messages":[
@@ -134,7 +140,30 @@ func TestClaudeExecutor_PreservesSignedThinkingBlocks(t *testing.T) {
 	if !strings.Contains(string(upstreamBody), "anthropic signed thought") {
 		t.Fatalf("expected signed thinking block to be preserved, got:\n%s", upstreamBody)
 	}
-	if !strings.Contains(string(upstreamBody), validSig) {
-		t.Fatalf("expected signature to be preserved, got:\n%s", upstreamBody)
+	if sig := gjson.GetBytes(upstreamBody, "messages.1.content.0.signature").String(); sig == "" {
+		t.Fatalf("expected signature to be preserved on the thinking block, got:\n%s", upstreamBody)
 	}
+}
+
+// validClaudeThinkingSignature builds an Anthropic provider-native thinking
+// signature recognized by the signature sanitizer (E-form protobuf envelope).
+func validClaudeThinkingSignature() string {
+	channelBlock := []byte{}
+	channelBlock = protowire.AppendTag(channelBlock, 1, protowire.VarintType)
+	channelBlock = protowire.AppendVarint(channelBlock, 12)
+	channelBlock = protowire.AppendTag(channelBlock, 2, protowire.VarintType)
+	channelBlock = protowire.AppendVarint(channelBlock, 2)
+	channelBlock = protowire.AppendTag(channelBlock, 6, protowire.BytesType)
+	channelBlock = protowire.AppendString(channelBlock, "claude-sonnet-4-6")
+
+	container := []byte{}
+	container = protowire.AppendTag(container, 1, protowire.BytesType)
+	container = protowire.AppendBytes(container, channelBlock)
+
+	payload := []byte{}
+	payload = protowire.AppendTag(payload, 2, protowire.BytesType)
+	payload = protowire.AppendBytes(payload, container)
+	payload = protowire.AppendTag(payload, 3, protowire.VarintType)
+	payload = protowire.AppendVarint(payload, 1)
+	return base64.StdEncoding.EncodeToString(payload)
 }
