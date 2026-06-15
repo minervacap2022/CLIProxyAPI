@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 var statisticsEnabled atomic.Bool
@@ -401,21 +401,8 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 	if ctx != nil {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
-			path := ginCtx.FullPath()
-			if path == "" && ginCtx.Request != nil {
-				path = ginCtx.Request.URL.Path
-			}
-			method := ""
-			if ginCtx.Request != nil {
-				method = ginCtx.Request.Method
-			}
-			if path != "" {
-				if method != "" {
-					return method + " " + path
-				}
-				return path
-			}
+		if endpoint := strings.TrimSpace(internallogging.GetEndpoint(ctx)); endpoint != "" {
+			return endpoint
 		}
 	}
 	if record.Provider != "" {
@@ -425,14 +412,7 @@ func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 }
 
 func resolveSuccess(ctx context.Context) bool {
-	if ctx == nil {
-		return true
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return true
-	}
-	status := ginCtx.Writer.Status()
+	status := internallogging.GetResponseStatus(ctx)
 	if status == 0 {
 		return true
 	}

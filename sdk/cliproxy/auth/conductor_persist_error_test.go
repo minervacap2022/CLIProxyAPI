@@ -10,7 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	loghook "github.com/sirupsen/logrus/hooks/test"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // failingStore always returns an error from Save.

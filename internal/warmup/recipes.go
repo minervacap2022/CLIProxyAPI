@@ -10,7 +10,7 @@ package warmup
 import (
 	"strings"
 
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/sjson"
 )
 
