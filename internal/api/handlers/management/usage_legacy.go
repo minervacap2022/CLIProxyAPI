@@ -64,6 +64,7 @@ func (h *Handler) GetUsageTimeseries(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"bucket": bucket,
 			"points": []usage.TimeseriesPoint{},
+			"rows":   []usage.TimeseriesRow{},
 		})
 		return
 	}
@@ -71,6 +72,7 @@ func (h *Handler) GetUsageTimeseries(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"bucket": bucket,
 			"points": agg.Timeseries(start, end, bucket),
+			"rows":   agg.TimeseriesRows(start, end, bucket),
 			"source": "aggregator",
 		})
 		return
@@ -78,6 +80,7 @@ func (h *Handler) GetUsageTimeseries(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"bucket": bucket,
 		"points": h.usageStats.Timeseries(start, end, bucket),
+		"rows":   h.usageStats.TimeseriesRows(start, end, bucket),
 		"source": "memory",
 	})
 }

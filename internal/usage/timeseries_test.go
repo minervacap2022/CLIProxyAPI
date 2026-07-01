@@ -85,3 +85,38 @@ func TestAggregatorTimeseriesAggregatesByDay(t *testing.T) {
 		t.Fatalf("day2 point = %+v", points[1])
 	}
 }
+
+func TestRequestStatisticsTimeseriesRowsGroupByAPIKeyAndHour(t *testing.T) {
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 1, 2, 10, 15, 0, 0, time.UTC)
+
+	record := func(key string, at time.Time, total int64) {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      key,
+			Model:       "gpt-5",
+			RequestedAt: at,
+			Detail: coreusage.Detail{
+				TotalTokens: total,
+			},
+		})
+	}
+
+	record("sk-a", base, 10)
+	record("sk-b", base.Add(5*time.Minute), 4)
+	record("sk-a", base.Add(65*time.Minute), 7)
+
+	rows := stats.TimeseriesRows(base.Add(-time.Minute), base.Add(2*time.Hour), UsageBucketHour)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+
+	if rows[0].APIKey != "sk-a" || rows[0].TotalTokens != 10 {
+		t.Fatalf("row0 = %+v", rows[0])
+	}
+	if rows[1].APIKey != "sk-b" || rows[1].TotalTokens != 4 {
+		t.Fatalf("row1 = %+v", rows[1])
+	}
+	if rows[2].APIKey != "sk-a" || rows[2].TotalTokens != 7 {
+		t.Fatalf("row2 = %+v", rows[2])
+	}
+}

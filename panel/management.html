@@ -603,8 +603,10 @@ ${i.comment}`:i.comment}this.doc.range[2]=i.offset;break}default:this.errors.pus
     return arr(resp && (resp.rows || resp.data || resp)).map(row => {
       if (!isObj(row)) return null;
       const parts = tokenParts(row);
+      const label = resolveLabel(row.api_key || row.apiKey || row.key);
+      if (!label) return null;
       return {
-        label: resolveLabel(row.api_key || row.apiKey || row.key),
+        label,
         model: safeLabel(row.model || 'Unknown model', 'Unknown model'),
         requests: num(row.requests),
         failed: num(row.failed),
@@ -616,7 +618,29 @@ ${i.comment}`:i.comment}this.doc.range[2]=i.offset;break}default:this.errors.pus
       };
     }).filter(Boolean);
   }
-  function timeseriesPoints(resp){
+  function timeseriesPoints(resp, resolveLabel){
+    const rows = arr(resp && resp.rows);
+    if (rows.length) {
+      const acc = new Map();
+      rows.forEach(row => {
+        if (!isObj(row)) return;
+        const label = resolveLabel(row.api_key || row.apiKey || row.key);
+        if (!label) return;
+        const start = Date.parse(row.start || row.timestamp || row.ts || '');
+        if (!Number.isFinite(start)) return;
+        const key = String(start);
+        const point = acc.get(key) || { start, requests: 0, failed: 0, input: 0, output: 0, reasoning: 0, cached: 0, total: 0 };
+        point.requests += num(row.requests);
+        point.failed += num(row.failed);
+        point.input += num(row.input_tokens);
+        point.output += num(row.output_tokens);
+        point.reasoning += num(row.reasoning_tokens);
+        point.cached += num(row.cached_tokens);
+        point.total += num(row.total_tokens);
+        acc.set(key, point);
+      });
+      return Array.from(acc.values()).sort((a, b) => a.start - b.start);
+    }
     return arr(resp && (resp.points || resp.data || resp)).map(point => {
       if (!isObj(point)) return null;
       const start = Date.parse(point.start || point.timestamp || point.ts || '');
@@ -814,7 +838,7 @@ ${i.comment}`:i.comment}this.doc.range[2]=i.offset;break}default:this.errors.pus
       ]);
       const resolveLabel = buildResolver(configList(cfgResp));
       const summary = aggregate(summaryRows(summaryResp, resolveLabel));
-      const points = timeseriesPoints(timeseriesResp);
+      const points = timeseriesPoints(timeseriesResp, resolveLabel);
       const bucket = String((timeseriesResp && timeseriesResp.bucket) || 'hour');
       el.innerHTML = renderData(summary, points, range, bucket);
       bindControls();

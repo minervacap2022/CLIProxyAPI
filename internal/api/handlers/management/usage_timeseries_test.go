@@ -50,6 +50,7 @@ func TestGetUsageTimeseriesReturnsHourlyPoints(t *testing.T) {
 	var payload struct {
 		Bucket string                          `json:"bucket"`
 		Points []usageinternal.TimeseriesPoint `json:"points"`
+		Rows   []usageinternal.TimeseriesRow   `json:"rows"`
 		Source string                          `json:"source"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
@@ -66,5 +67,11 @@ func TestGetUsageTimeseriesReturnsHourlyPoints(t *testing.T) {
 	}
 	if payload.Points[0].TotalTokens != 12 || payload.Points[1].Failed != 1 {
 		t.Fatalf("points = %+v", payload.Points)
+	}
+	if len(payload.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(payload.Rows))
+	}
+	if payload.Rows[0].APIKey != "sk-a" || payload.Rows[1].Failed != 1 {
+		t.Fatalf("rows = %+v", payload.Rows)
 	}
 }
