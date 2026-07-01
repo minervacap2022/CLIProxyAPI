@@ -52,6 +52,36 @@ func (h *Handler) GetUsageSummary(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"rows": rows, "source": "memory"})
 }
 
+// GetUsageTimeseries returns total usage points grouped by hour or day for the
+// optional [start, end] window. This powers the lightweight usage charts
+// without returning the full per-request snapshot.
+func (h *Handler) GetUsageTimeseries(c *gin.Context) {
+	start := parseUsageTime(c.Query("start"))
+	end := parseUsageTime(c.Query("end"))
+	bucket := usage.ResolveUsageBucket(c.Query("bucket"), start, end)
+
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"bucket": bucket,
+			"points": []usage.TimeseriesPoint{},
+		})
+		return
+	}
+	if agg := usage.DefaultAggregator(); agg != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"bucket": bucket,
+			"points": agg.Timeseries(start, end, bucket),
+			"source": "aggregator",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"bucket": bucket,
+		"points": h.usageStats.Timeseries(start, end, bucket),
+		"source": "memory",
+	})
+}
+
 // parseUsageTime parses a query value as RFC3339 or unix milliseconds. An empty
 // or unparseable value yields the zero time (treated as unbounded).
 func parseUsageTime(value string) time.Time {

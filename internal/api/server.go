@@ -674,6 +674,7 @@ func (s *Server) registerManagementRoutes() {
 		// remains the new Redis-queue consumer entry point.
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.GET("/usage/summary", s.mgmt.GetUsageSummary)
+		mgmt.GET("/usage/timeseries", s.mgmt.GetUsageTimeseries)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 
@@ -1051,11 +1052,11 @@ func (s *Server) serveModelsWithGroups(c *gin.Context, models []map[string]any) 
 	if s.cfg != nil {
 		for _, mg := range s.cfg.ModelGroups {
 			models = append(models, map[string]any{
-				"id":          mg.Name,
-				"object":      "model",
-				"created":     0,
-				"owned_by":    "model-group",
-				"type":        "model-group",
+				"id":           mg.Name,
+				"object":       "model",
+				"created":      0,
+				"owned_by":     "model-group",
+				"type":         "model-group",
 				"display_name": mg.Name,
 			})
 		}
