@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -16,17 +17,17 @@ func writeTestConfig(t *testing.T, yamlData string) string {
 	return p
 }
 
-func TestMergeAPIKeyConfigsIntoFlatList_EmptyConfigs(t *testing.T) {
+func TestReconcileAPIKeyConfigsIntoFlatList_EmptyConfigs(t *testing.T) {
 	cfg := &Config{
 		SDKConfig: SDKConfig{APIKeys: []string{"existing-key"}},
 	}
-	cfg.MergeAPIKeyConfigsIntoFlatList()
+	cfg.ReconcileAPIKeyConfigsIntoFlatList()
 	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0] != "existing-key" {
 		t.Fatalf("expected flat list unchanged, got %v", cfg.APIKeys)
 	}
 }
 
-func TestMergeAPIKeyConfigsIntoFlatList_AddsNewKeys(t *testing.T) {
+func TestReconcileAPIKeyConfigsIntoFlatList_AddsNewKeys(t *testing.T) {
 	cfg := &Config{
 		SDKConfig: SDKConfig{APIKeys: []string{"key-a"}},
 		APIKeyConfigs: []APIKeyConfig{
@@ -34,13 +35,13 @@ func TestMergeAPIKeyConfigsIntoFlatList_AddsNewKeys(t *testing.T) {
 			{Key: "key-c"},
 		},
 	}
-	cfg.MergeAPIKeyConfigsIntoFlatList()
+	cfg.ReconcileAPIKeyConfigsIntoFlatList()
 	if len(cfg.APIKeys) != 3 {
 		t.Fatalf("expected 3 keys, got %d: %v", len(cfg.APIKeys), cfg.APIKeys)
 	}
 }
 
-func TestMergeAPIKeyConfigsIntoFlatList_DeduplicatesExisting(t *testing.T) {
+func TestReconcileAPIKeyConfigsIntoFlatList_DeduplicatesExisting(t *testing.T) {
 	cfg := &Config{
 		SDKConfig: SDKConfig{APIKeys: []string{"key-a", "key-b"}},
 		APIKeyConfigs: []APIKeyConfig{
@@ -48,35 +49,35 @@ func TestMergeAPIKeyConfigsIntoFlatList_DeduplicatesExisting(t *testing.T) {
 			{Key: "key-c"},
 		},
 	}
-	cfg.MergeAPIKeyConfigsIntoFlatList()
+	cfg.ReconcileAPIKeyConfigsIntoFlatList()
 	if len(cfg.APIKeys) != 3 {
 		t.Fatalf("expected 3 keys (no dup), got %d: %v", len(cfg.APIKeys), cfg.APIKeys)
 	}
 }
 
-func TestMergeAPIKeyConfigsIntoFlatList_SkipsBlankKeys(t *testing.T) {
+func TestReconcileAPIKeyConfigsIntoFlatList_SkipsBlankKeys(t *testing.T) {
 	cfg := &Config{
 		APIKeyConfigs: []APIKeyConfig{
 			{Key: "  ", Label: "blank key"},
 			{Key: "valid-key"},
 		},
 	}
-	cfg.MergeAPIKeyConfigsIntoFlatList()
+	cfg.ReconcileAPIKeyConfigsIntoFlatList()
 	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0] != "valid-key" {
 		t.Fatalf("expected only 'valid-key', got %v", cfg.APIKeys)
 	}
 }
 
-func TestMergeAPIKeyConfigsIntoFlatList_Idempotent(t *testing.T) {
+func TestReconcileAPIKeyConfigsIntoFlatList_Idempotent(t *testing.T) {
 	cfg := &Config{
 		SDKConfig: SDKConfig{APIKeys: []string{"key-a"}},
 		APIKeyConfigs: []APIKeyConfig{
 			{Key: "key-b"},
 		},
 	}
-	cfg.MergeAPIKeyConfigsIntoFlatList()
+	cfg.ReconcileAPIKeyConfigsIntoFlatList()
 	first := append([]string(nil), cfg.APIKeys...)
-	cfg.MergeAPIKeyConfigsIntoFlatList()
+	cfg.ReconcileAPIKeyConfigsIntoFlatList()
 	if len(cfg.APIKeys) != len(first) {
 		t.Errorf("merge is not idempotent: first=%v second=%v", first, cfg.APIKeys)
 	}
@@ -87,9 +88,23 @@ func TestMergeAPIKeyConfigsIntoFlatList_Idempotent(t *testing.T) {
 	}
 }
 
-func TestMergeAPIKeyConfigsIntoFlatList_NilReceiver(t *testing.T) {
+func TestReconcileAPIKeyConfigsIntoFlatList_ReplacesLoadedPolicyKeys(t *testing.T) {
+	cfg := &Config{
+		SDKConfig:     SDKConfig{APIKeys: []string{"flat-key", "old-policy-key", "old-policy-key"}},
+		APIKeyConfigs: []APIKeyConfig{{Key: "new-policy-key"}, {Key: "new-policy-key"}},
+	}
+
+	cfg.ReconcileAPIKeyConfigsIntoFlatList([]APIKeyConfig{{Key: "old-policy-key"}})
+
+	want := []string{"flat-key", "new-policy-key"}
+	if !reflect.DeepEqual(cfg.APIKeys, want) {
+		t.Fatalf("APIKeys = %v, want %v", cfg.APIKeys, want)
+	}
+}
+
+func TestReconcileAPIKeyConfigsIntoFlatList_NilReceiver(t *testing.T) {
 	var cfg *Config
-	cfg.MergeAPIKeyConfigsIntoFlatList() // must not panic
+	cfg.ReconcileAPIKeyConfigsIntoFlatList() // must not panic
 }
 
 func TestSanitizeAPIKeyConfigs_TrimsWhitespace(t *testing.T) {

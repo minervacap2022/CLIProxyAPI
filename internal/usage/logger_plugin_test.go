@@ -127,3 +127,31 @@ func TestRequestStatisticsDetailsRingBufferCap(t *testing.T) {
 		t.Fatalf("retained window wrong: first=%d last=%d", ms.Details[0].Tokens.TotalTokens, ms.Details[4].Tokens.TotalTokens)
 	}
 }
+
+func TestRequestStatisticsRestorePreservesTotalsBeyondDetailCap(t *testing.T) {
+	prev := int(maxDetailsPerModel.Load())
+	SetMaxDetailsPerModel(5)
+	defer SetMaxDetailsPerModel(prev)
+
+	stats := NewRequestStatistics()
+	base := time.Now()
+	for i := 0; i < 12; i++ {
+		stats.Record(context.Background(), coreusage.Record{APIKey: "k", Model: "m", RequestedAt: base.Add(time.Duration(i) * time.Second), Detail: coreusage.Detail{TotalTokens: 1}})
+	}
+	snapshot := stats.Snapshot()
+	restored := NewRequestStatistics()
+	restored.MergeSnapshot(snapshot)
+	got := restored.Snapshot()
+	if got.TotalRequests != 12 || got.TotalTokens != 12 {
+		t.Fatalf("restored totals = %d/%d, want 12/12", got.TotalRequests, got.TotalTokens)
+	}
+	model := restored.apis["k"].Models["m"]
+	if model.TotalRequests != 12 || model.DetailsBase != 7 || len(model.Details) != 5 {
+		t.Fatalf("restored model = %+v", model)
+	}
+	agg := newTestAggregator(restored)
+	agg.cursor["k"+aggFieldSep+"m"] = int(model.DetailsBase + int64(len(model.Details)))
+	if dirty := agg.fold(); len(dirty) != 0 {
+		t.Fatalf("restored cursor refolded %d buckets", len(dirty))
+	}
+}

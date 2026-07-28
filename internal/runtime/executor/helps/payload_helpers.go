@@ -15,8 +15,8 @@ import (
 )
 
 // ApplyPayloadConfigWithRoot behaves like applyPayloadConfig but treats all parameter
-// paths as relative to the provided root path (for example, "request" for Gemini CLI)
-// and restricts matches to the given protocol when supplied. Defaults are checked
+// paths as relative to the provided root path and restricts matches to the given
+// protocol when supplied. Defaults are checked
 // against the original payload when provided. requestedModel carries the client-visible
 // model name before alias resolution so payload rules can target aliases precisely.
 // requestPath is the inbound HTTP request path (when available) used for endpoint-scoped gates.
@@ -120,11 +120,7 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 						continue
 					}
 					for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
-						updated, errSet := sjson.SetBytes(out, resolvedPath, value)
-						if errSet != nil {
-							continue
-						}
-						out = updated
+						out = setPayloadValueIfDifferent(out, resolvedPath, value)
 					}
 				}
 			}
@@ -144,11 +140,7 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 						continue
 					}
 					for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
-						updated, errSet := sjson.SetRawBytes(out, resolvedPath, rawValue)
-						if errSet != nil {
-							continue
-						}
-						out = updated
+						out = SetRawIfDifferent(out, resolvedPath, rawValue)
 					}
 				}
 			}
@@ -398,8 +390,6 @@ func normalizePayloadFromProtocol(protocol string) string {
 	switch protocol {
 	case "openai-response", "openai-responses", "response":
 		return "responses"
-	case "gemini-cli":
-		return "gemini"
 	default:
 		return protocol
 	}
@@ -794,23 +784,64 @@ func removeToolTypeFromToolsArray(payload []byte, toolsPath string, toolType str
 	if !tools.Exists() || !tools.IsArray() {
 		return payload
 	}
+	toolItems := tools.Array()
 	removed := false
-	filtered := []byte(`[]`)
-	for _, tool := range tools.Array() {
+	for _, tool := range toolItems {
 		if tool.Get("type").String() == toolType {
 			removed = true
-			continue
+			break
 		}
-		updated, errSet := sjson.SetRawBytes(filtered, "-1", []byte(tool.Raw))
-		if errSet != nil {
-			continue
-		}
-		filtered = updated
 	}
 	if !removed {
 		return payload
 	}
-	updated, errSet := sjson.SetRawBytes(payload, toolsPath, filtered)
+	filtered := make([][]byte, 0, len(toolItems))
+	for _, tool := range toolItems {
+		if tool.Get("type").String() != toolType {
+			filtered = append(filtered, []byte(tool.Raw))
+		}
+	}
+	updated, errSet := sjson.SetRawBytes(payload, toolsPath, JoinRawJSONArray(filtered))
+	if errSet != nil {
+		return payload
+	}
+	return updated
+}
+
+func setPayloadValueIfDifferent(payload []byte, path string, value any) []byte {
+	current := gjson.GetBytes(payload, path)
+	switch typed := value.(type) {
+	case string:
+		if current.Type == gjson.String && current.String() == typed {
+			return payload
+		}
+	case bool:
+		if (typed && current.Type == gjson.True) || (!typed && current.Type == gjson.False) {
+			return payload
+		}
+	case nil:
+		if current.Raw == "null" {
+			return payload
+		}
+	default:
+		expectedJSON, errSet := sjson.SetBytes([]byte(`{}`), "value", value)
+		if errSet != nil {
+			return payload
+		}
+		expected := gjson.GetBytes(expectedJSON, "value")
+		if expected.Raw == "" {
+			return payload
+		}
+		if len(current.Indexes) == 0 && current.Raw == expected.Raw {
+			return payload
+		}
+		updated, errSet := sjson.SetRawBytes(payload, path, []byte(expected.Raw))
+		if errSet != nil {
+			return payload
+		}
+		return updated
+	}
+	updated, errSet := sjson.SetBytes(payload, path, value)
 	if errSet != nil {
 		return payload
 	}

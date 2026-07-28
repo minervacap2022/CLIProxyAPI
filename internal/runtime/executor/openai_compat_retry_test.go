@@ -50,6 +50,9 @@ func TestParseDoubaoRetryAfter_BurstTooFast(t *testing.T) {
 	if *d != doubaoBurstCooldown {
 		t.Errorf("expected %v, got %v", doubaoBurstCooldown, *d)
 	}
+	if err := (statusErr{code: 429, retryAfter: d}); err.AccountQuota() {
+		t.Fatal("RequestBurstTooFast must remain model-local")
+	}
 
 	// Unrelated 429 (e.g., generic rate limit) → still nil
 	if parseDoubaoRetryAfter([]byte(`{"error":{"code":"RateLimitExceeded","message":"too many requests"}}`)) != nil {

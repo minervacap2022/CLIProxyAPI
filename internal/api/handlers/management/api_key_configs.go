@@ -49,9 +49,10 @@ func (h *Handler) PutAPIKeyConfigs(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	previous := h.cfg.APIKeyConfigs
 	h.cfg.APIKeyConfigs = append([]config.APIKeyConfig(nil), body.APIKeyConfigs...)
 	h.cfg.SanitizeAPIKeyConfigs()
-	h.cfg.MergeAPIKeyConfigsIntoFlatList()
+	h.cfg.ReconcileAPIKeyConfigsIntoFlatList(previous)
 	h.keyConfigRefreshIfSet()
 	h.persist(c)
 }
@@ -72,11 +73,12 @@ func (h *Handler) PatchAPIKeyConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "key field is required"})
 		return
 	}
+	previous := append([]config.APIKeyConfig(nil), h.cfg.APIKeyConfigs...)
 	for i := range h.cfg.APIKeyConfigs {
 		if h.cfg.APIKeyConfigs[i].Key == incoming.Key {
 			h.cfg.APIKeyConfigs[i] = incoming
 			h.cfg.SanitizeAPIKeyConfigs()
-			h.cfg.MergeAPIKeyConfigsIntoFlatList()
+			h.cfg.ReconcileAPIKeyConfigsIntoFlatList(previous)
 			h.keyConfigRefreshIfSet()
 			h.persist(c)
 			return
@@ -84,7 +86,7 @@ func (h *Handler) PatchAPIKeyConfig(c *gin.Context) {
 	}
 	h.cfg.APIKeyConfigs = append(h.cfg.APIKeyConfigs, incoming)
 	h.cfg.SanitizeAPIKeyConfigs()
-	h.cfg.MergeAPIKeyConfigsIntoFlatList()
+	h.cfg.ReconcileAPIKeyConfigsIntoFlatList(previous)
 	h.keyConfigRefreshIfSet()
 	h.persist(c)
 }
@@ -96,6 +98,7 @@ func (h *Handler) DeleteAPIKeyConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "key query parameter required"})
 		return
 	}
+	previous := append([]config.APIKeyConfig(nil), h.cfg.APIKeyConfigs...)
 	out := h.cfg.APIKeyConfigs[:0]
 	for _, kc := range h.cfg.APIKeyConfigs {
 		if kc.Key != key {
@@ -104,7 +107,7 @@ func (h *Handler) DeleteAPIKeyConfig(c *gin.Context) {
 	}
 	h.cfg.APIKeyConfigs = out
 	h.cfg.SanitizeAPIKeyConfigs()
-	h.cfg.MergeAPIKeyConfigsIntoFlatList()
+	h.cfg.ReconcileAPIKeyConfigsIntoFlatList(previous)
 	h.keyConfigRefreshIfSet()
 	h.persist(c)
 }

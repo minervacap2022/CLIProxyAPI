@@ -56,7 +56,6 @@ func (h *Handler) PutWarmup(c *gin.Context) {
 		return
 	}
 
-	// Snapshot for rollback if Reload rejects the new config.
 	previous := h.cfg.Warmup
 	h.cfg.Warmup = config.WarmupConfig{
 		Enabled:     payload.Enabled,
@@ -70,9 +69,6 @@ func (h *Handler) PutWarmup(c *gin.Context) {
 		Timeout:     payload.Timeout,
 	}
 
-	// If a scheduler is wired, validate by asking it to reload before we persist.
-	// If no controller is wired (e.g. service embedded without warmup), we still
-	// persist — the settings take effect on next startup.
 	if h.warmupController != nil {
 		if err := h.warmupController.Reload(); err != nil {
 			h.cfg.Warmup = previous
@@ -82,14 +78,11 @@ func (h *Handler) PutWarmup(c *gin.Context) {
 	}
 
 	if !h.persist(c) {
-		// persist() already wrote an error response and rolled back to previous.
-		// Reload the controller back to the old config to avoid drift.
+		h.cfg.Warmup = previous
 		if h.warmupController != nil {
 			_ = h.warmupController.Reload()
 		}
-		return
 	}
-	c.JSON(http.StatusOK, gin.H{"warmup": h.cfg.Warmup})
 }
 
 // TriggerWarmup fires a single warmup round synchronously. Returns 202 on
@@ -107,6 +100,6 @@ func (h *Handler) TriggerWarmup(c *gin.Context) {
 	if err := c.ShouldBindJSON(&payload); err == nil && payload.Reason != "" {
 		reason = payload.Reason
 	}
-	go h.warmupController.TriggerNow(c.Copy().Request.Context(), reason)
+	go h.warmupController.TriggerNow(reason)
 	c.JSON(http.StatusAccepted, gin.H{"status": "triggered", "reason": reason})
 }

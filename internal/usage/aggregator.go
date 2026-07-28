@@ -101,9 +101,10 @@ type Aggregator struct {
 	cursorKey string
 	opts      AggregatorOptions
 
-	mu      sync.RWMutex
-	buckets map[bucketKey]*aggBucket
-	cursor  map[string]int // "api\x1fmodel" -> processed detail count
+	mu           sync.RWMutex
+	buckets      map[bucketKey]*aggBucket
+	cursor       map[string]int // "api\x1fmodel" -> processed detail count
+	pendingDirty map[bucketKey]struct{}
 
 	stopCh  chan struct{}
 	doneCh  chan struct{}
@@ -139,15 +140,16 @@ func NewAggregator(opts AggregatorOptions, stats *RequestStatistics) (*Aggregato
 	}
 
 	return &Aggregator{
-		stats:     stats,
-		client:    cli,
-		bucketKey: opts.Key,
-		cursorKey: opts.Key + ":cursor",
-		opts:      opts,
-		buckets:   make(map[bucketKey]*aggBucket),
-		cursor:    make(map[string]int),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
+		stats:        stats,
+		client:       cli,
+		bucketKey:    opts.Key,
+		cursorKey:    opts.Key + ":cursor",
+		opts:         opts,
+		buckets:      make(map[bucketKey]*aggBucket),
+		cursor:       make(map[string]int),
+		pendingDirty: make(map[bucketKey]struct{}),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
 	}, nil
 }
 
@@ -222,10 +224,25 @@ func (a *Aggregator) loop(ctx context.Context) {
 // tick folds new details into buckets and flushes dirty buckets to Redis.
 func (a *Aggregator) tick(ctx context.Context) {
 	dirty := a.fold()
+	a.mu.Lock()
+	for key := range dirty {
+		a.pendingDirty[key] = struct{}{}
+	}
+	pending := make(map[bucketKey]struct{}, len(a.pendingDirty))
+	for key := range a.pendingDirty {
+		pending[key] = struct{}{}
+	}
+	a.mu.Unlock()
 	if a.opts.RetentionDays > 0 {
 		a.prune()
 	}
-	a.flush(ctx, dirty)
+	if a.flush(ctx, pending) {
+		a.mu.Lock()
+		for key := range pending {
+			delete(a.pendingDirty, key)
+		}
+		a.mu.Unlock()
+	}
 }
 
 // fold walks un-processed details for each (api, model) and accumulates them
@@ -332,9 +349,9 @@ func (a *Aggregator) prune() {
 }
 
 // flush writes dirty buckets and the cursor to Redis.
-func (a *Aggregator) flush(ctx context.Context, dirty map[bucketKey]struct{}) {
+func (a *Aggregator) flush(ctx context.Context, dirty map[bucketKey]struct{}) bool {
 	if a == nil || a.client == nil || len(dirty) == 0 {
-		return
+		return len(dirty) == 0
 	}
 	a.mu.RLock()
 	values := make(map[string]interface{}, len(dirty))
@@ -353,7 +370,7 @@ func (a *Aggregator) flush(ctx context.Context, dirty map[bucketKey]struct{}) {
 	a.mu.RUnlock()
 
 	if len(values) == 0 {
-		return
+		return true
 	}
 	flushCtx, cancel := context.WithTimeout(ctx, aggOpTimeout)
 	defer cancel()
@@ -362,7 +379,9 @@ func (a *Aggregator) flush(ctx context.Context, dirty map[bucketKey]struct{}) {
 	pipe.Set(flushCtx, a.cursorKey, cursorRaw, 0)
 	if _, err := pipe.Exec(flushCtx); err != nil {
 		log.WithError(err).Warn("usage: aggregator flush failed; will retry on next tick")
+		return false
 	}
+	return true
 }
 
 // Summary returns api_key × model rows summed over buckets whose hour overlaps

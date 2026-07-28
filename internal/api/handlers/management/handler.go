@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -38,55 +39,42 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                    *config.Config
-	configFilePath         string
-	mu                     sync.Mutex
-	attemptsMu             sync.Mutex
-	failedAttempts         map[string]*attemptInfo // keyed by client IP
-	authManager            *coreauth.Manager
-	tokenStore             coreauth.Store
-	localPassword          string
-	allowRemoteOverride    bool
-	envSecret              string
-	logDir                 string
-	postAuthHook           coreauth.PostAuthHook
-	postAuthPersistHook    coreauth.PostAuthHook
-	pluginHost             *pluginhost.Host
-	configReloadHook       func(context.Context, *config.Config)
-	pluginStoreRegistryURL string
-	pluginStoreHTTPClient  pluginstore.HTTPDoer
-	pluginReleaseCacheMu   sync.Mutex
-	pluginReleaseCache     map[string]pluginReleaseCacheEntry
-	/*
-	 * keyConfigRefreshFunc is called whenever api-key-configs or model-groups change
-	 * so the server can immediately rebuild its in-memory lookup indexes.
-	 * It is optional; when nil the change takes effect after the next file-watcher reload.
-	 */
-	keyConfigRefreshFunc func()
-
-	// warmupController is an optional hook to restart / trigger the warmup
-	// scheduler when the warmup config is mutated via the management API.
-	warmupController WarmupController
-
-	// usageStats provides the in-memory usage statistics used by the
-	// /usage, /usage/export, /usage/import legacy endpoints (Klik fork).
-	// May be nil; handlers then fall back to an empty snapshot.
-	usageStats *usage.RequestStatistics
+	cfg                     *config.Config
+	configFilePath          string
+	mu                      sync.Mutex
+	reloadMu                sync.Mutex
+	reloadGeneration        uint64
+	appliedReloadGeneration uint64
+	attemptsMu              sync.Mutex
+	failedAttempts          map[string]*attemptInfo // keyed by client IP
+	authManager             *coreauth.Manager
+	tokenStore              coreauth.Store
+	localPassword           string
+	allowRemoteOverride     bool
+	envSecret               string
+	logDir                  string
+	postAuthHook            coreauth.PostAuthHook
+	postAuthPersistHook     coreauth.PostAuthHook
+	pluginHost              *pluginhost.Host
+	configReloadHook        func(context.Context, *config.Config)
+	pluginStoreRegistryURL  string
+	pluginStoreHTTPClient   pluginstore.HTTPDoer
+	pluginReleaseCacheMu    sync.Mutex
+	pluginReleaseCache      map[string]pluginReleaseCacheEntry
+	keyConfigRefreshFunc    func()
+	warmupController        WarmupController
+	usageStats              *usage.RequestStatistics
 }
 
-// WarmupController abstracts the warmup scheduler so management handlers can
-// trigger rounds or ask the service to reload the scheduler after config
-// updates without introducing a hard dependency on internal/warmup.
 type WarmupController interface {
-	// TriggerNow runs a single warmup round synchronously.
-	TriggerNow(ctx context.Context, reason string)
-	// Reload applies the current config.Warmup settings — stops the previous
-	// scheduler and starts a new one using the cfg.Warmup values. Errors are
-	// returned for invalid configs so the management API can surface them.
+	TriggerNow(string)
 	Reload() error
-	// SupportedProviders returns the provider keys that have a warmup recipe
-	// registered, for surfacing in the management UI.
 	SupportedProviders() []string
+}
+
+type configReloadSnapshot struct {
+	cfg        *config.Config
+	generation uint64
 }
 
 // NewHandler creates a new management handler instance.
@@ -182,21 +170,77 @@ func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)
 	h.mu.Unlock()
 }
 
-func (h *Handler) reloadConfigAfterManagementSave(ctx context.Context, cfg *config.Config) {
-	if h == nil || cfg == nil {
+// reloadSnapshotConfigLocked clones the runtime config and assigns a reload generation.
+// Callers must hold h.mu.
+func (h *Handler) reloadSnapshotConfigLocked() configReloadSnapshot {
+	if h == nil || h.cfg == nil {
+		return configReloadSnapshot{}
+	}
+	h.reloadGeneration++
+	return configReloadSnapshot{
+		cfg:        h.cfg.CloneForRuntime(),
+		generation: h.reloadGeneration,
+	}
+}
+
+// saveConfigAndSnapshotLocked saves h.cfg and returns a full runtime config snapshot.
+// Callers must hold h.mu.
+func (h *Handler) saveConfigAndSnapshotLocked(c *gin.Context) (configReloadSnapshot, bool) {
+	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
+		return configReloadSnapshot{}, false
+	}
+	return h.reloadSnapshotConfigLocked(), true
+}
+
+// reloadConfigAfterManagementSave reloads from an independent config snapshot.
+// Callers must pass a full Config clone captured immediately after a successful save.
+func (h *Handler) reloadConfigAfterManagementSave(ctx context.Context, snapshot configReloadSnapshot) {
+	if h == nil || snapshot.cfg == nil || snapshot.generation == 0 {
 		return
 	}
+	h.reloadMu.Lock()
+	defer h.reloadMu.Unlock()
+
 	h.mu.Lock()
+	if snapshot.generation < h.appliedReloadGeneration {
+		h.mu.Unlock()
+		return
+	}
 	hook := h.configReloadHook
 	host := h.pluginHost
 	h.mu.Unlock()
 	if hook != nil {
-		hook(ctx, cfg)
+		hook(ctx, snapshot.cfg)
+	} else if host != nil {
+		host.ApplyConfig(ctx, snapshot.cfg)
+	}
+
+	h.mu.Lock()
+	if snapshot.generation > h.appliedReloadGeneration {
+		h.appliedReloadGeneration = snapshot.generation
+	}
+	h.mu.Unlock()
+}
+
+// reloadConfigAfterManagementSaveAsync reloads from an independent config snapshot.
+// Callers must pass a full Config clone captured immediately after a successful save.
+func (h *Handler) reloadConfigAfterManagementSaveAsync(ctx context.Context, snapshot configReloadSnapshot) {
+	if h == nil || snapshot.cfg == nil || snapshot.generation == 0 {
 		return
 	}
-	if host != nil {
-		host.ApplyConfig(ctx, cfg)
+	reloadCtx := context.Background()
+	if ctx != nil {
+		reloadCtx = context.WithoutCancel(ctx)
 	}
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.WithField("panic", recovered).Error("management: async config reload panicked")
+			}
+		}()
+		h.reloadConfigAfterManagementSave(reloadCtx, snapshot)
+	}()
 }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
@@ -220,30 +264,31 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
 }
 
-// SetKeyConfigRefreshFunc registers an optional callback invoked after api-key-configs or
-// model-groups are modified via the management API, allowing the server to immediately
-// rebuild its in-memory lookup indexes.
-func (h *Handler) SetKeyConfigRefreshFunc(f func()) {
-	h.keyConfigRefreshFunc = f
+func (h *Handler) SetKeyConfigRefreshFunc(refresh func()) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.keyConfigRefreshFunc = refresh
+	h.mu.Unlock()
 }
 
-// SetUsageStatistics injects the in-memory usage statistics store used by the
-// legacy /usage, /usage/export, /usage/import endpoints. Safe to call with nil
-// to disable those endpoints' data path.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) {
 	if h == nil {
 		return
 	}
+	h.mu.Lock()
 	h.usageStats = stats
+	h.mu.Unlock()
 }
 
-// SetWarmupController wires the warmup scheduler into the management handler
-// so operators can trigger rounds and reload the scheduler after config edits.
-// Passing nil clears the controller (warmup endpoints will return 503).
-func (h *Handler) SetWarmupController(ctrl WarmupController) {
+func (h *Handler) SetWarmupController(controller WarmupController) {
+	if h == nil {
+		return
+	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.warmupController = ctrl
+	h.warmupController = controller
+	h.mu.Unlock()
 }
 
 // SetPostAuthPersistHook registers a hook to be called after auth persistence.
@@ -403,7 +448,13 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
+	snapshot := h.reloadSnapshotConfigLocked()
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	var reqCtx context.Context
+	if c != nil && c.Request != nil {
+		reqCtx = c.Request.Context()
+	}
+	h.reloadConfigAfterManagementSaveAsync(reqCtx, snapshot)
 	return true
 }
 

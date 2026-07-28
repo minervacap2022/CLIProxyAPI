@@ -6,6 +6,7 @@ package usage
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -168,6 +169,7 @@ type APISnapshot struct {
 type ModelSnapshot struct {
 	TotalRequests int64           `json:"total_requests"`
 	TotalTokens   int64           `json:"total_tokens"`
+	DetailsBase   int64           `json:"details_base,omitempty"`
 	Details       []RequestDetail `json:"details"`
 }
 
@@ -302,6 +304,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests: modelStatsValue.TotalRequests,
 				TotalTokens:   modelStatsValue.TotalTokens,
+				DetailsBase:   modelStatsValue.DetailsBase,
 				Details:       requestDetails,
 			}
 		}
@@ -348,6 +351,43 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.totalRequests == 0 && snapshot.TotalRequests > 0 {
+		s.totalRequests = snapshot.TotalRequests
+		s.successCount = snapshot.SuccessCount
+		s.failureCount = snapshot.FailureCount
+		s.totalTokens = snapshot.TotalTokens
+		for key, value := range snapshot.RequestsByDay {
+			s.requestsByDay[key] = value
+		}
+		for key, value := range snapshot.RequestsByHour {
+			if hour, err := strconv.Atoi(key); err == nil {
+				s.requestsByHour[hour] = value
+			}
+		}
+		for key, value := range snapshot.TokensByDay {
+			s.tokensByDay[key] = value
+		}
+		for key, value := range snapshot.TokensByHour {
+			if hour, err := strconv.Atoi(key); err == nil {
+				s.tokensByHour[hour] = value
+			}
+		}
+		for apiName, apiSnapshot := range snapshot.APIs {
+			stats := &apiStats{TotalRequests: apiSnapshot.TotalRequests, TotalTokens: apiSnapshot.TotalTokens, Models: make(map[string]*modelStats)}
+			for modelName, modelSnapshot := range apiSnapshot.Models {
+				details := append([]RequestDetail(nil), modelSnapshot.Details...)
+				detailsBase := modelSnapshot.DetailsBase
+				if detailsBase == 0 && modelSnapshot.TotalRequests > int64(len(details)) {
+					detailsBase = modelSnapshot.TotalRequests - int64(len(details))
+				}
+				stats.Models[modelName] = &modelStats{TotalRequests: modelSnapshot.TotalRequests, TotalTokens: modelSnapshot.TotalTokens, DetailsBase: detailsBase, Details: details}
+				result.Added += int64(len(details))
+			}
+			s.apis[apiName] = stats
+		}
+		return result
+	}
 
 	seen := make(map[string]struct{})
 	for apiName, stats := range s.apis {
@@ -400,7 +440,6 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			}
 		}
 	}
-
 	return result
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -24,6 +26,17 @@ func resetAntigravityCreditsRetryState() {
 	antigravityShortCooldownByAuth = sync.Map{}
 	antigravityCreditsBalanceByAuth = sync.Map{}
 	antigravityCreditsHintRefreshByID = sync.Map{}
+}
+
+type closeSignalReadCloser struct {
+	io.ReadCloser
+	closed chan<- struct{}
+}
+
+func (c *closeSignalReadCloser) Close() error {
+	errClose := c.ReadCloser.Close()
+	close(c.closed)
+	return errClose
 }
 
 type fakeAntigravityKVClient struct {
@@ -247,16 +260,16 @@ func TestInjectEnabledCreditTypes(t *testing.T) {
 
 func TestParseRetryDelay_HumanReadableDuration(t *testing.T) {
 	body := []byte(`{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 1h43m56s."}}`)
-	retryAfter, err := parseRetryDelay(body)
+	retryAfter, err := helps.ParseRetryDelay(body)
 	if err != nil {
-		t.Fatalf("parseRetryDelay() error = %v", err)
+		t.Fatalf("helps.ParseRetryDelay() error = %v", err)
 	}
 	if retryAfter == nil {
-		t.Fatal("parseRetryDelay() returned nil")
+		t.Fatal("helps.ParseRetryDelay() returned nil")
 	}
 	want := time.Hour + 43*time.Minute + 56*time.Second
 	if *retryAfter != want {
-		t.Fatalf("parseRetryDelay() = %v, want %v", *retryAfter, want)
+		t.Fatalf("helps.ParseRetryDelay() = %v, want %v", *retryAfter, want)
 	}
 }
 
@@ -337,7 +350,7 @@ func TestAntigravityExecute_CreditsInjectedWhenConductorRequests(t *testing.T) {
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
 	})
 	auth := &cliproxyauth.Auth{
-		ID: "auth-credits-conductor",
+		ID: fmt.Sprintf("auth-credits-conductor-%d", time.Now().UnixNano()),
 		Attributes: map[string]string{
 			"base_url": server.URL,
 		},
@@ -360,6 +373,16 @@ func TestAntigravityExecute_CreditsInjectedWhenConductorRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
+	stateValue, ok := antigravityCreditsHintRefreshByID.Load(auth.ID)
+	if !ok {
+		t.Fatal("expected credits refresh state")
+	}
+	state, ok := stateValue.(*antigravityCreditsHintRefreshState)
+	if !ok || state == nil {
+		t.Fatal("credits refresh state has unexpected type")
+	}
+	state.mu.Lock()
+	state.mu.Unlock()
 	if len(resp.Payload) == 0 {
 		t.Fatal("Execute() returned empty payload")
 	}
@@ -623,12 +646,13 @@ func TestEnsureAccessToken_WarmTokenLoadsCreditsHint(t *testing.T) {
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
 	})
 	auth := &cliproxyauth.Auth{
-		ID: "auth-warm-token-credits",
+		ID: fmt.Sprintf("auth-warm-token-credits-%d", time.Now().UnixNano()),
 		Metadata: map[string]any{
 			"access_token": "token",
 			"expired":      time.Now().Add(1 * time.Hour).Format(time.RFC3339),
 		},
 	}
+	refreshDone := make(chan struct{})
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.String() != "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
 			t.Fatalf("unexpected request url %s", req.URL.String())
@@ -636,7 +660,10 @@ func TestEnsureAccessToken_WarmTokenLoadsCreditsHint(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"paidTier":{"id":"tier-1","availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":"25000","minimumCreditAmountForUsage":"50"}]}}`)),
+			Body: &closeSignalReadCloser{
+				ReadCloser: io.NopCloser(strings.NewReader(`{"paidTier":{"id":"tier-1","availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":"25000","minimumCreditAmountForUsage":"50"}]}}`)),
+				closed:     refreshDone,
+			},
 		}, nil
 	}))
 
@@ -650,9 +677,10 @@ func TestEnsureAccessToken_WarmTokenLoadsCreditsHint(t *testing.T) {
 	if updatedAuth != nil {
 		t.Fatalf("ensureAccessToken() updatedAuth = %v, want nil", updatedAuth)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !cliproxyauth.HasKnownAntigravityCreditsHint(auth.ID) {
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-refreshDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for background credits refresh")
 	}
 	if !cliproxyauth.HasKnownAntigravityCreditsHint(auth.ID) {
 		t.Fatal("expected credits hint to be populated for warm token auth")
@@ -674,8 +702,8 @@ func TestUpdateAntigravityCreditsBalance_LoadCodeAssistUserAgent(t *testing.T) {
 	t.Cleanup(resetAntigravityCreditsRetryState)
 
 	exec := NewAntigravityExecutor(&config.Config{})
-	const configuredUserAgent = "antigravity/1.23.2 windows/amd64 google-api-nodejs-client/10.3.0"
-	const loadCodeAssistUserAgent = "antigravity/1.23.2 windows/amd64"
+	const configuredUserAgent = "antigravity/hub/1.23.2 windows/amd64 google-api-nodejs-client/10.3.0"
+	const loadCodeAssistUserAgent = "antigravity/hub/1.23.2 windows/amd64"
 	auth := &cliproxyauth.Auth{
 		ID:         "auth-load-code-assist-ua",
 		Attributes: map[string]string{"user_agent": configuredUserAgent},

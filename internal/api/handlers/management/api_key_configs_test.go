@@ -7,10 +7,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
@@ -125,6 +128,34 @@ func TestPutAPIKeyConfigs_SyncsAPIKeysFlatList(t *testing.T) {
 	}
 }
 
+func TestPutAPIKeyConfigs_RevokesLoadedPolicyKeyAndPreservesDistinctFlatKey(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+api-keys:
+  - flat-key
+  - removed-key
+api-key-configs:
+  - key: removed-key
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.LoadConfigOptional(configPath, false)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	h, _ := newTestHandlerWithConfig(t, cfg)
+
+	w := doRequest(t, h.PutAPIKeyConfigs, http.MethodPut, `{"api-key-configs":[{"key":"replacement-key"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got, want := h.cfg.APIKeys, []string{"flat-key", "replacement-key"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("APIKeys = %v, want %v", got, want)
+	}
+	assertAPIKeyAuthentication(t, h.cfg, "removed-key", false)
+	assertAPIKeyAuthentication(t, h.cfg, "flat-key", true)
+}
+
 func TestPutAPIKeyConfigs_InvalidBody_Returns400(t *testing.T) {
 	h, _ := newTestHandlerWithConfig(t, &config.Config{})
 	w := doRequest(t, h.PutAPIKeyConfigs, http.MethodPut, "not-json")
@@ -165,6 +196,22 @@ func TestPatchAPIKeyConfig_UpdatesExistingEntry(t *testing.T) {
 	}
 	if len(h.cfg.APIKeyConfigs[0].AllowedModels) != 1 || h.cfg.APIKeyConfigs[0].AllowedModels[0] != "m1" {
 		t.Errorf("unexpected allowed-models: %v", h.cfg.APIKeyConfigs[0].AllowedModels)
+	}
+}
+
+func TestPatchAPIKeyConfig_UpdatesLoadedPolicyWithoutDuplicatingFlatKey(t *testing.T) {
+	cfg := &config.Config{
+		SDKConfig:     sdkconfig.SDKConfig{APIKeys: []string{"flat-key", "policy-key"}},
+		APIKeyConfigs: []config.APIKeyConfig{{Key: "policy-key", Label: "old"}},
+	}
+	h, _ := newTestHandlerWithConfig(t, cfg)
+
+	w := doRequest(t, h.PatchAPIKeyConfig, http.MethodPatch, `{"value":{"key":"policy-key","label":"updated"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got, want := h.cfg.APIKeys, []string{"flat-key", "policy-key"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("APIKeys = %v, want %v", got, want)
 	}
 }
 
@@ -209,6 +256,39 @@ func TestDeleteAPIKeyConfig_RemovesMatchingEntry(t *testing.T) {
 	}
 	if len(h.cfg.APIKeyConfigs) != 1 || h.cfg.APIKeyConfigs[0].Key != "keep" {
 		t.Errorf("unexpected entries after delete: %v", h.cfg.APIKeyConfigs)
+	}
+}
+
+func TestDeleteAPIKeyConfig_RevokesLoadedPolicyKeyAndPreservesDistinctFlatKey(t *testing.T) {
+	cfg := &config.Config{
+		SDKConfig:     sdkconfig.SDKConfig{APIKeys: []string{"flat-key", "remove"}},
+		APIKeyConfigs: []config.APIKeyConfig{{Key: "remove"}},
+	}
+	h, _ := newTestHandlerWithConfig(t, cfg)
+
+	w := doRequestWithQuery(t, h.DeleteAPIKeyConfig, http.MethodDelete, "key=remove")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got, want := h.cfg.APIKeys, []string{"flat-key"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("APIKeys = %v, want %v", got, want)
+	}
+	assertAPIKeyAuthentication(t, h.cfg, "remove", false)
+	assertAPIKeyAuthentication(t, h.cfg, "flat-key", true)
+}
+
+func assertAPIKeyAuthentication(t *testing.T, cfg *config.Config, key string, allowed bool) {
+	t.Helper()
+	configaccess.Register(&cfg.SDKConfig)
+	providers := sdkaccess.RegisteredProviders()
+	if len(providers) != 1 {
+		t.Fatalf("providers = %d, want 1", len(providers))
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	_, authErr := providers[0].Authenticate(req.Context(), req)
+	if (authErr == nil) != allowed {
+		t.Fatalf("key %q allowed = %t, want %t; error=%v", key, authErr == nil, allowed, authErr)
 	}
 }
 
@@ -266,4 +346,3 @@ func TestDeleteAPIKeyConfig_CallsRefreshFunc(t *testing.T) {
 		t.Error("expected refresh func to be called after DELETE")
 	}
 }
-

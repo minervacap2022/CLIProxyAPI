@@ -33,9 +33,10 @@ func ctxWithGinKeyConfigs(kc *internalconfig.APIKeyConfig, mg *internalconfig.Mo
 // set and a success payload (the model name) for all other models. It supports both Execute
 // and ExecuteStream.
 type modelAwareExecutor struct {
-	mu          sync.Mutex
-	calls       []string
-	quotaModels map[string]bool
+	mu            sync.Mutex
+	calls         []string
+	quotaModels   map[string]bool
+	streamHeaders map[string]http.Header
 }
 
 func newModelAwareExecutor(quotaModels ...string) *modelAwareExecutor {
@@ -78,11 +79,11 @@ func (e *modelAwareExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, 
 			},
 		}
 		close(ch)
-		return &coreexecutor.StreamResult{Chunks: ch}, nil
+		return &coreexecutor.StreamResult{Headers: e.streamHeaders[req.Model], Chunks: ch}, nil
 	}
 	ch <- coreexecutor.StreamChunk{Payload: []byte(req.Model)}
 	close(ch)
-	return &coreexecutor.StreamResult{Chunks: ch}, nil
+	return &coreexecutor.StreamResult{Headers: e.streamHeaders[req.Model], Chunks: ch}, nil
 }
 
 func (e *modelAwareExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
@@ -149,8 +150,8 @@ func setupGroupHandler(t *testing.T, exec coreauth.ProviderExecutor, modelIDs ..
 
 type statusErr struct{ code int }
 
-func (e *statusErr) Error() string      { return http.StatusText(e.code) }
-func (e *statusErr) StatusCode() int    { return e.code }
+func (e *statusErr) Error() string   { return http.StatusText(e.code) }
+func (e *statusErr) StatusCode() int { return e.code }
 
 func TestIsQuotaExhausted_TooManyRequests(t *testing.T) {
 	if !isQuotaExhausted(&statusErr{http.StatusTooManyRequests}) {
@@ -508,6 +509,36 @@ func TestExecuteStreamWithAuthManager_ModelGroupFallback(t *testing.T) {
 
 	if string(got) != "fallback-model" {
 		t.Errorf("expected payload 'fallback-model', got %q", got)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_ModelGroupPreservesSelectedHeaders(t *testing.T) {
+	exec := newModelAwareExecutor("quota-model")
+	exec.streamHeaders = map[string]http.Header{
+		"quota-model":    {"X-Candidate": {"failed"}},
+		"fallback-model": {"X-Candidate": {"selected"}},
+	}
+	handler := setupGroupHandler(t, exec, "quota-model", "fallback-model")
+	handler.Cfg.PassthroughHeaders = true
+	mg := &internalconfig.ModelGroup{
+		Name: "header-group",
+		Models: []internalconfig.ModelGroupEntry{
+			{Model: "quota-model", Priority: 2},
+			{Model: "fallback-model", Priority: 1},
+		},
+	}
+	ctx := ctxWithGinKeyConfigs(&internalconfig.APIKeyConfig{Key: "k", ModelGroup: "header-group"}, mg)
+
+	data, headers, errs := handler.ExecuteStreamWithAuthManager(ctx, "openai", "header-group", []byte(`{}`), "")
+	for range data {
+	}
+	for errMsg := range errs {
+		if errMsg != nil {
+			t.Fatalf("unexpected error: %v", errMsg.Error)
+		}
+	}
+	if got := headers.Get("X-Candidate"); got != "selected" {
+		t.Fatalf("X-Candidate = %q, want selected", got)
 	}
 }
 

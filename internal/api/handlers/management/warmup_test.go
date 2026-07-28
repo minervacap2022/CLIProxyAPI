@@ -2,8 +2,8 @@ package management
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,7 +21,7 @@ type fakeWarmupCtrl struct {
 	providerList []string
 }
 
-func (f *fakeWarmupCtrl) TriggerNow(_ context.Context, reason string) {
+func (f *fakeWarmupCtrl) TriggerNow(reason string) {
 	f.triggered = append(f.triggered, reason)
 }
 func (f *fakeWarmupCtrl) Reload() error {
@@ -93,6 +93,14 @@ func TestPutWarmup_UpdatesConfigAndReloads(t *testing.T) {
 	if ctrl.reloadCalls != 1 {
 		t.Errorf("expected one reload call, got %d", ctrl.reloadCalls)
 	}
+	var response map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(w.Body.Bytes()))
+	if err := decoder.Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if err := decoder.Decode(&response); err != io.EOF {
+		t.Fatalf("expected exactly one JSON response, second decode error = %v", err)
+	}
 }
 
 func TestPutWarmup_RollsBackOnReloadError(t *testing.T) {
@@ -114,6 +122,31 @@ func TestPutWarmup_RollsBackOnReloadError(t *testing.T) {
 	}
 	if h.cfg.Warmup.Interval != "2h" {
 		t.Errorf("config not rolled back: %+v", h.cfg.Warmup)
+	}
+}
+
+func TestPutWarmup_RollsBackOnPersistError(t *testing.T) {
+	original := config.WarmupConfig{Enabled: true, Interval: "2h"}
+	h, _ := newWarmupTestHandler(t, original)
+	h.configFilePath = filepath.Join(t.TempDir(), "missing", "config.yaml")
+	ctrl := &fakeWarmupCtrl{}
+	h.SetWarmupController(ctrl)
+
+	body := []byte(`{"enabled":true,"interval":"1h"}`)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPut, "/warmup", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.PutWarmup(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	if h.cfg.Warmup.Enabled != original.Enabled || h.cfg.Warmup.Interval != original.Interval {
+		t.Fatalf("config after persist failure = %+v, want %+v", h.cfg.Warmup, original)
+	}
+	if ctrl.reloadCalls != 2 {
+		t.Fatalf("reload calls = %d, want 2", ctrl.reloadCalls)
 	}
 }
 

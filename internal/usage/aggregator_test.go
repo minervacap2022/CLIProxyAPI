@@ -13,10 +13,11 @@ import (
 // prune never touch the client, so they are exercised hermetically.
 func newTestAggregator(stats *RequestStatistics) *Aggregator {
 	return &Aggregator{
-		stats:   stats,
-		buckets: make(map[bucketKey]*aggBucket),
-		cursor:  make(map[string]int),
-		opts:    AggregatorOptions{Interval: defaultAggInterval},
+		stats:        stats,
+		buckets:      make(map[bucketKey]*aggBucket),
+		cursor:       make(map[string]int),
+		pendingDirty: make(map[bucketKey]struct{}),
+		opts:         AggregatorOptions{Interval: defaultAggInterval},
 	}
 }
 
@@ -208,5 +209,16 @@ func TestAggregatorFoldSurvivesDetailEviction(t *testing.T) {
 	agg.fold()
 	if got := agg.Summary(time.Time{}, time.Time{}); got[0].Requests != 7 {
 		t.Fatalf("re-fold double counted: %+v", got)
+	}
+}
+
+func TestAggregatorRetainsDirtyBatchAfterFlushFailure(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{APIKey: "retry", Model: "m", RequestedAt: time.Now(), Detail: coreusage.Detail{TotalTokens: 13}})
+	agg := newTestAggregator(stats)
+	agg.pendingDirty[bucketKey{api: "existing", model: "m", hour: 1}] = struct{}{}
+	agg.tick(context.Background())
+	if len(agg.pendingDirty) != 2 {
+		t.Fatalf("pending dirty buckets = %d, want 2 after failed flush", len(agg.pendingDirty))
 	}
 }

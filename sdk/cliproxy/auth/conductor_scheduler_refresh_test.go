@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
+
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -43,6 +46,25 @@ type unauthorizedRefreshTestExecutor struct {
 
 func (e unauthorizedRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
 	return nil, errors.New("token refresh failed with status 401: invalid_grant")
+}
+
+func TestManager_ScheduledRefreshFailureLogsWarning(t *testing.T) {
+	hook := logtest.NewLocal(log.StandardLogger())
+	t.Cleanup(hook.Reset)
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(unauthorizedRefreshTestExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"}})
+	auth := &Auth{ID: "scheduled-refresh-warning", Provider: "codex", Metadata: map[string]any{"email": "x@example.com"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	manager.refreshAuth(context.Background(), auth.ID)
+	entry := hook.LastEntry()
+	if entry == nil || entry.Level != log.WarnLevel || entry.Message != "scheduled auth refresh failed" {
+		t.Fatalf("last log = %+v, want Warn scheduled auth refresh failed", entry)
+	}
+	if entry.Data["auth_id"] != auth.ID {
+		t.Fatalf("auth_id = %v, want %q", entry.Data["auth_id"], auth.ID)
+	}
 }
 
 func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.T) {
