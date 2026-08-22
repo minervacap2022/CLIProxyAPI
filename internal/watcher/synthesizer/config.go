@@ -228,6 +228,8 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		}
 		base := strings.TrimSpace(compat.BaseURL)
 		disableCooling := compat.DisableCooling
+		protocol := strings.TrimSpace(compat.Protocol)
+		authType := strings.TrimSpace(compat.AuthType)
 
 		// Handle new APIKeyEntries format (preferred)
 		createdEntries := 0
@@ -238,10 +240,12 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
 			id, token := idGen.Next(idKind, key, base, proxyURL)
 			attrs := map[string]string{
-				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
-				"base_url":     base,
-				"compat_name":  compat.Name,
-				"provider_key": providerName,
+				"source":           fmt.Sprintf("config:%s[%s]", providerName, token),
+				"base_url":         base,
+				"compat_name":      compat.Name,
+				"provider_key":     providerName,
+				"compat_protocol":  protocol,
+				"compat_auth_type": authType,
 			}
 			metadata := map[string]any{}
 			if disableCooling {
@@ -280,10 +284,12 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
 			id, token := idGen.Next(idKind, base)
 			attrs := map[string]string{
-				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
-				"base_url":     base,
-				"compat_name":  compat.Name,
-				"provider_key": providerName,
+				"source":           fmt.Sprintf("config:%s[%s]", providerName, token),
+				"base_url":         base,
+				"compat_name":      compat.Name,
+				"provider_key":     providerName,
+				"compat_protocol":  protocol,
+				"compat_auth_type": authType,
 			}
 			metadata := map[string]any{}
 			if disableCooling {
