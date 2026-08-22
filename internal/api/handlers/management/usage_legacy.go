@@ -14,6 +14,8 @@ package management
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,6 +31,37 @@ type usageExportPayload struct {
 type usageImportPayload struct {
 	Version int                      `json:"version"`
 	Usage   usage.StatisticsSnapshot `json:"usage"`
+}
+
+// GetUsageSummary returns API-key-by-model aggregated usage rows for an optional
+// RFC3339 or Unix-millisecond [start, end] window. It keeps the Team dashboard
+// from downloading every stored per-request detail.
+func (h *Handler) GetUsageSummary(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusOK, gin.H{"rows": []usage.SummaryRow{}})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"rows": h.usageStats.SummaryRows(
+			parseUsageTime(c.Query("start")),
+			parseUsageTime(c.Query("end")),
+		),
+	})
+}
+
+func parseUsageTime(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed
+	}
+	if milliseconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return time.UnixMilli(milliseconds)
+	}
+	return time.Time{}
 }
 
 // GetUsageStatistics returns the in-memory request statistics snapshot.
