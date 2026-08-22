@@ -86,7 +86,7 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
-func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
+func TestManagementUsageEndpointsRequireManagementAuth(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
 	prevQueueEnabled := redisqueue.Enabled()
@@ -108,12 +108,27 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
 	}
 
-	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)
+	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
 	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
 	legacyRR := httptest.NewRecorder()
 	server.engine.ServeHTTP(legacyRR, legacyReq)
-	if legacyRR.Code != http.StatusNotFound {
-		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusNotFound, legacyRR.Body.String())
+	if legacyRR.Code != http.StatusOK {
+		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusOK, legacyRR.Body.String())
+	}
+
+	summaryMissingKeyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage/summary", nil)
+	summaryMissingKeyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(summaryMissingKeyRR, summaryMissingKeyReq)
+	if summaryMissingKeyRR.Code != http.StatusUnauthorized {
+		t.Fatalf("summary missing key status = %d, want %d body=%s", summaryMissingKeyRR.Code, http.StatusUnauthorized, summaryMissingKeyRR.Body.String())
+	}
+
+	summaryReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage/summary", nil)
+	summaryReq.Header.Set("Authorization", "Bearer test-management-key")
+	summaryRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(summaryRR, summaryReq)
+	if summaryRR.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d body=%s", summaryRR.Code, http.StatusOK, summaryRR.Body.String())
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
