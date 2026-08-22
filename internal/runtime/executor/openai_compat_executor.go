@@ -55,14 +55,18 @@ func (e *OpenAICompatExecutor) PrepareRequest(req *http.Request, auth *cliproxya
 		return nil
 	}
 	_, apiKey := e.resolveCredentials(auth)
-	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(req, attrs)
+	if e.compatProtocol(auth) == openAICompatProtocolAnthropic {
+		e.applyAnthropicCompatHeaders(req, auth, apiKey, false)
+		return nil
+	}
+	if strings.TrimSpace(apiKey) != "" && req.Header.Get("Authorization") == "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	return nil
 }
 
@@ -83,6 +87,9 @@ func (e *OpenAICompatExecutor) HttpRequest(ctx context.Context, auth *cliproxyau
 }
 
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if e.compatProtocol(auth) == openAICompatProtocolAnthropic {
+		return e.executeAnthropicCompat(ctx, auth, req, opts)
+	}
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImages(ctx, auth, req, opts, endpointPath)
 	}
@@ -292,6 +299,9 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 }
 
 func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if e.compatProtocol(auth) == openAICompatProtocolAnthropic {
+		return e.executeAnthropicCompatStream(ctx, auth, req, opts)
+	}
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImagesStream(ctx, auth, req, opts, endpointPath)
 	}

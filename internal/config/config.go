@@ -678,8 +678,8 @@ type GeminiModel struct {
 func (m GeminiModel) GetName() string  { return m.Name }
 func (m GeminiModel) GetAlias() string { return m.Alias }
 
-// OpenAICompatibility represents the configuration for OpenAI API compatibility
-// with external providers, allowing model aliases to be routed through OpenAI API format.
+// OpenAICompatibility represents the configuration for OpenAI- or Anthropic-compatible
+// external providers, allowing model aliases to be routed through the selected API format.
 type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
@@ -694,7 +694,15 @@ type OpenAICompatibility struct {
 	// Prefix optionally namespaces model aliases for this provider (e.g., "teamA/kimi-k2").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
-	// BaseURL is the base URL for the external OpenAI-compatible API endpoint.
+	// Protocol selects the upstream request protocol. Supported values are "openai"
+	// (default) and "anthropic".
+	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+
+	// AuthType selects how the configured API key is sent to the upstream.
+	// Supported values are "bearer" (default) and "x-api-key".
+	AuthType string `yaml:"auth-type,omitempty" json:"auth-type,omitempty"`
+
+	// BaseURL is the base URL for the external compatibility API endpoint.
 	BaseURL string `yaml:"base-url" json:"base-url"`
 
 	// APIKeyEntries defines API keys with optional per-key proxy configuration.
@@ -1187,6 +1195,8 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.Name = strings.TrimSpace(e.Name)
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.Protocol = normalizeCompatibilityProtocol(e.Protocol)
+		e.AuthType = normalizeCompatibilityAuthType(e.AuthType)
 		e.Headers = NormalizeHeaders(e.Headers)
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
@@ -1195,6 +1205,24 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		out = append(out, e)
 	}
 	cfg.OpenAICompatibility = out
+}
+
+func normalizeCompatibilityProtocol(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "anthropic":
+		return "anthropic"
+	default:
+		return "openai"
+	}
+}
+
+func normalizeCompatibilityAuthType(authType string) string {
+	switch strings.ToLower(strings.TrimSpace(authType)) {
+	case "x-api-key", "api-key", "apikey":
+		return "x-api-key"
+	default:
+		return "bearer"
+	}
 }
 
 // SanitizeCodexKeys removes Codex API key entries missing a BaseURL.

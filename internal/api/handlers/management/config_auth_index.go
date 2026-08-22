@@ -38,6 +38,8 @@ type openAICompatibilityWithAuthIndex struct {
 	Priority      int                                      `json:"priority,omitempty"`
 	Disabled      bool                                     `json:"disabled"`
 	Prefix        string                                   `json:"prefix,omitempty"`
+	Protocol      string                                   `json:"protocol,omitempty"`
+	AuthType      string                                   `json:"auth-type,omitempty"`
 	BaseURL       string                                   `json:"base-url"`
 	APIKeyEntries []openAICompatibilityAPIKeyWithAuthIndex `json:"api-key-entries,omitempty"`
 	Models        []config.OpenAICompatibilityModel        `json:"models,omitempty"`
@@ -218,6 +220,8 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 			Priority:  entry.Priority,
 			Disabled:  entry.Disabled,
 			Prefix:    entry.Prefix,
+			Protocol:  entry.Protocol,
+			AuthType:  entry.AuthType,
 			BaseURL:   entry.BaseURL,
 			Models:    entry.Models,
 			Headers:   entry.Headers,
