@@ -293,6 +293,14 @@ nonstream-keepalive-interval: 0
 #   beta-features: "multi_agent"
 
 # OpenAI compatibility providers
+# Command Code is supported through the included commandcode-proxy sidecar. It translates
+# CPA's OpenAI-compatible requests to Command Code's native API and keeps its required
+# device fingerprint and lifecycle requests inside the sidecar.
+#   - name: "commandcode"
+#     base-url: "http://commandcode-proxy:3050/v1"
+#     api-key-entries:
+#       - api-key: "user_..."
+#     models: [] # Use Management → OAuth Login → Command Code to verify the key and import models.
 # openai-compatibility:
 #   - name: "openrouter" # The name of the provider; it will be used in the user agent and other places.
 #     disabled: false # optional: set to true to disable this provider without removing it

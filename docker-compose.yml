@@ -1,4 +1,12 @@
 services:
+    commandcode-proxy:
+        image: ghcr.io/maxeaglet/commandcode-proxy:latest
+        pull_policy: always
+        container_name: commandcode-proxy
+        environment:
+            - PORT=3050
+        restart: unless-stopped
+
     cliproxyapi:
         image: ${CLI_PROXY_IMAGE:-ghcr.io/minervacap2022/cliproxyapi:latest}
         pull_policy: always
